@@ -65,7 +65,29 @@ Security note: keep `XAI_API_KEY` on the agent side. Don’t pass the key over Z
 
 ## ZeroMQ integration (intended)
 
-Today the repo only validates that both sides can initialize their libraries. The next technical decision is the **messaging pattern** and **wire format**.
+The repo now includes a working **PUB/SUB** demo to stream macro headlines from C++ → Node. It’s intentionally a standalone CLI flow (not tied to any frontend/UI yet), so you can iterate on the agent behavior later.
+
+### Current implementation (PUB/SUB headlines)
+
+- **Publisher (C++)**: `cpp_engine` binds a `PUB` socket (default `tcp://127.0.0.1:5555`).
+  - The bind endpoint can be overridden by passing `argv[1]`.
+  - A simulated headline is sampled every 2 seconds.
+  - Only headlines matching the hardcoded macro keyword filter are published.
+- **Subscriber (TypeScript)**: `ts_agent` has a `SUB` process that connects to an endpoint (default `tcp://127.0.0.1:5555`) and logs matched macro headlines.
+  - Endpoint override: CLI arg `node dist/subscriber.js tcp://127.0.0.1:6000` (via `npm run sub -- ...`) or `ZMQ_ENDPOINT` env var.
+
+**Macro keyword filter (both sides)**
+
+- Keywords (case-insensitive substring match): `FOMC`, `CPI`, `Rates`, `Powell`.
+- C++ filters before publish; TS filters again before logging.
+
+**Message framing**
+
+- No topic frames are used right now.
+- Each publish is a single frame: UTF-8 JSON string with fields:
+  - `type`: `"headline"`
+  - `ts`: UTC ISO8601 timestamp
+  - `headline`: headline text
 
 ### Recommended starting point
 
