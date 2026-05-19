@@ -30,6 +30,12 @@ type HeadlineAnalysis = {
   summary: string;
 };
 
+type AlertContext = {
+  headline: string;
+  analysis: HeadlineAnalysis;
+  sentAt: number;
+};
+
 type ChatCompletionResponse = {
   choices?: Array<{
     message?: {
@@ -44,9 +50,11 @@ type ModelListResponse = {
 
 const userPreferences = new Map<string, UserPreferences>();
 const spacesById = new Map<string, Space>();
+const lastAlertBySpace = new Map<string, AlertContext>();
 
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
 const HEADLINE_DEDUPE_TTL_MS = 2 * 60 * 1000;
+const ALERT_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const processedMessageKeys = new Map<string, number>();
 const inFlightMessageKeys = new Set<string>();
 const processedHeadlineKeys = new Map<string, number>();
@@ -369,6 +377,113 @@ function formatSentimentLabel(sentiment: number): string {
   return "neutral";
 }
 
+function getRecentAlertContext(spaceId: string): AlertContext | null {
+  const ctx = lastAlertBySpace.get(spaceId);
+  if (!ctx) return null;
+  if (Date.now() - ctx.sentAt > ALERT_CONTEXT_TTL_MS) {
+    lastAlertBySpace.delete(spaceId);
+    return null;
+  }
+  return ctx;
+}
+
+function rememberAlertContext(
+  spaceId: string,
+  headline: string,
+  analysis: HeadlineAnalysis,
+): void {
+  lastAlertBySpace.set(spaceId, {
+    headline,
+    analysis,
+    sentAt: Date.now(),
+  });
+}
+
+function looksLikeAlertFollowUp(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  if (t.endsWith("?")) return true;
+
+  const patterns = [
+    /^why\b/,
+    /^what\b/,
+    /^how\b/,
+    /^when\b/,
+    /^explain\b/,
+    /^summarize\b/,
+    /^summary\b/,
+    /^tell me\b/,
+    /^can you\b/,
+    /^could you\b/,
+    /\bmore detail/,
+    /\bwhole report\b/,
+    /\bthis mean\b/,
+    /\bbreak (it )?down\b/,
+    /\belaborate\b/,
+    /\bhawkish\b/,
+    /\bdovish\b/,
+    /\bmarket impact\b/,
+    /\btrade\b.*\?/,
+  ];
+  return patterns.some((p) => p.test(t));
+}
+
+function looksLikePreferenceUpdate(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  const patterns = [
+    /\balert me\b/,
+    /\bnotify me\b/,
+    /\btrack\b/,
+    /\bwatch for\b/,
+    /\bthreshold\b/,
+    /\bkeyword/,
+    /\bpreference/,
+    /\binterested in\b/,
+    /\bonly (alert|notify)\b/,
+    /\bstop alerting\b/,
+    /\bunsubscribe\b/,
+  ];
+  return patterns.some((p) => p.test(t));
+}
+
+function shouldHandleAsAlertFollowUp(
+  text: string,
+  spaceId: string,
+): boolean {
+  if (!getRecentAlertContext(spaceId)) return false;
+  if (looksLikePreferenceUpdate(text)) return false;
+  return looksLikeAlertFollowUp(text);
+}
+
+function formatAlertContextForLlm(ctx: AlertContext): string {
+  const sentimentLabel = formatSentimentLabel(ctx.analysis.sentiment);
+  const lines = [
+    `Headline: ${ctx.headline}`,
+    `Severity: ${ctx.analysis.severity.toFixed(2)}`,
+    `Sentiment: ${sentimentLabel} (${ctx.analysis.sentiment.toFixed(2)})`,
+  ];
+  if (ctx.analysis.summary) {
+    lines.push(`Summary: ${ctx.analysis.summary}`);
+  }
+  return lines.join("\n");
+}
+
+async function answerAlertFollowUp(
+  question: string,
+  ctx: AlertContext,
+): Promise<string> {
+  const system =
+    "You are a macro trading analyst helping a user understand a news alert they received. " +
+    "Use the alert context below. Answer clearly in plain text for iMessage (no JSON, no markdown code fences). " +
+    "Be specific about market implications when relevant. Keep under ~400 words unless they asked for a full report summary.";
+
+  const user =
+    `Alert context:\n${formatAlertContextForLlm(ctx)}\n\n` +
+    `User follow-up: ${question}`;
+
+  return grokChatCompletion(system, user, "Alert follow-up");
+}
+
 function formatAlertMessage(
   headline: string,
   analysis: HeadlineAnalysis,
@@ -435,6 +550,7 @@ async function dispatchHeadlineAlerts(
     const alert = formatAlertMessage(headline, analysis);
     try {
       await app.send(space, alert);
+      rememberAlertContext(spaceId, headline, analysis);
       console.log(`[ZMQ] proactive alert sent space=${spaceId}`);
     } catch (err) {
       console.error(`[ZMQ] failed to send alert space=${spaceId}:`, err);
@@ -614,7 +730,31 @@ async function main(): Promise<void> {
         `: ${text}`,
     );
 
+    const isAlertFollowUp = shouldHandleAsAlertFollowUp(text, spaceId);
+
     try {
+      if (isAlertFollowUp) {
+        const alertCtx = getRecentAlertContext(spaceId);
+        if (!alertCtx) {
+          await message.reply(
+            "I don't have a recent alert in context — ask again after your next macro alert.",
+          );
+          continue;
+        }
+
+        if (!process.env.XAI_API_KEY) {
+          await message.reply(
+            "I need an API key configured to answer follow-up questions.",
+          );
+          continue;
+        }
+
+        console.log(`[iMessage] alert follow-up space=${spaceId}: ${text}`);
+        const answer = await answerAlertFollowUp(text, alertCtx);
+        await message.reply(answer);
+        continue;
+      }
+
       const prefs = await extractPreferencesWithLlm(text);
       userPreferences.set(spaceId, prefs);
 
@@ -628,7 +768,13 @@ async function main(): Promise<void> {
       );
     } catch (err) {
       console.error(err);
-      await space.send("Sorry — I couldn't update your preferences right now.");
+      if (isAlertFollowUp) {
+        await message.reply(
+          "Sorry — I couldn't analyze that follow-up right now.",
+        );
+      } else {
+        await space.send("Sorry — I couldn't update your preferences right now.");
+      }
     } finally {
       finishProcessingMessage(messageKey);
     }
