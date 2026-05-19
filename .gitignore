@@ -1,0 +1,49 @@
+# macOS
+.DS_Store
+
+# Editor / tooling
+*.swp
+*.swo
+
+# --- C++ / CMake ---
+# Out-of-source builds
+cpp_engine/build/
+build/
+
+# CMake generated files (in case someone builds in-source)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+Testing/
+CTestTestfile.cmake
+install_manifest.txt
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# --- Node / TypeScript ---
+node_modules/
+dist/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env (keep .env.example committed)
+.env
+.env.*
+!.env.example
