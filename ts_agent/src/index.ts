@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Subscriber } from "zeromq";
+import { SpaceOutboundCoordinator } from "./spaceOutbound.js";
 
 type UserPreferences = {
   trackedKeywords: string[];
@@ -51,6 +52,7 @@ type ModelListResponse = {
 const userPreferences = new Map<string, UserPreferences>();
 const spacesById = new Map<string, Space>();
 const lastAlertBySpace = new Map<string, AlertContext>();
+const spaceOutbound = new SpaceOutboundCoordinator();
 
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
 const HEADLINE_DEDUPE_TTL_MS = 2 * 60 * 1000;
@@ -536,9 +538,7 @@ async function dispatchHeadlineAlerts(
   headline: string,
   analysis: HeadlineAnalysis,
 ): Promise<void> {
-  for (const [spaceId, prefs] of userPreferences) {
-    if (!shouldAlertUser(headline, analysis, prefs)) continue;
-
+  for (const spaceId of userPreferences.keys()) {
     const space = spacesById.get(spaceId);
     if (!space) {
       console.log(
@@ -549,9 +549,17 @@ async function dispatchHeadlineAlerts(
 
     const alert = formatAlertMessage(headline, analysis);
     try {
-      await app.send(space, alert);
-      rememberAlertContext(spaceId, headline, analysis);
-      console.log(`[ZMQ] proactive alert sent space=${spaceId}`);
+      const sent = await spaceOutbound.run(spaceId, "alert", async () => {
+        const prefs = userPreferences.get(spaceId);
+        if (!prefs || !shouldAlertUser(headline, analysis, prefs)) return false;
+
+        await app.send(space, alert);
+        rememberAlertContext(spaceId, headline, analysis);
+        return true;
+      });
+      if (sent) {
+        console.log(`[ZMQ] proactive alert sent space=${spaceId}`);
+      }
     } catch (err) {
       console.error(`[ZMQ] failed to send alert space=${spaceId}:`, err);
     }
@@ -730,54 +738,65 @@ async function main(): Promise<void> {
         `: ${text}`,
     );
 
-    const isAlertFollowUp = shouldHandleAsAlertFollowUp(text, spaceId);
+    void spaceOutbound
+      .run(spaceId, "user", async () => {
+        const releaseAlertHold = spaceOutbound.holdAlerts(spaceId);
+        const isAlertFollowUp = shouldHandleAsAlertFollowUp(text, spaceId);
 
-    try {
-      if (isAlertFollowUp) {
-        const alertCtx = getRecentAlertContext(spaceId);
-        if (!alertCtx) {
-          await message.reply(
-            "I don't have a recent alert in context — ask again after your next macro alert.",
+        try {
+          if (isAlertFollowUp) {
+            const alertCtx = getRecentAlertContext(spaceId);
+            if (!alertCtx) {
+              await message.reply(
+                "I don't have a recent alert in context — ask again after your next macro alert.",
+              );
+              return;
+            }
+
+            if (!process.env.XAI_API_KEY) {
+              await message.reply(
+                "I need an API key configured to answer follow-up questions.",
+              );
+              return;
+            }
+
+            console.log(`[iMessage] alert follow-up space=${spaceId}: ${text}`);
+            const answer = await answerAlertFollowUp(text, alertCtx);
+            await message.reply(answer);
+            return;
+          }
+
+          const prefs = await extractPreferencesWithLlm(text);
+          userPreferences.set(spaceId, prefs);
+
+          const keywordsPretty = prefs.trackedKeywords.length
+            ? prefs.trackedKeywords.join(", ")
+            : "(none)";
+          await space.send(
+            `Got it — saved your macro preferences for this chat.\n` +
+              `Tracked keywords: ${keywordsPretty}\n` +
+              `Sentiment threshold: ${prefs.sentimentThreshold}`,
           );
-          continue;
+        } catch (err) {
+          console.error(err);
+          if (isAlertFollowUp) {
+            await message.reply(
+              "Sorry — I couldn't analyze that follow-up right now.",
+            );
+          } else {
+            await space.send(
+              "Sorry — I couldn't update your preferences right now.",
+            );
+          }
+        } finally {
+          releaseAlertHold();
+          finishProcessingMessage(messageKey);
         }
-
-        if (!process.env.XAI_API_KEY) {
-          await message.reply(
-            "I need an API key configured to answer follow-up questions.",
-          );
-          continue;
-        }
-
-        console.log(`[iMessage] alert follow-up space=${spaceId}: ${text}`);
-        const answer = await answerAlertFollowUp(text, alertCtx);
-        await message.reply(answer);
-        continue;
-      }
-
-      const prefs = await extractPreferencesWithLlm(text);
-      userPreferences.set(spaceId, prefs);
-
-      const keywordsPretty = prefs.trackedKeywords.length
-        ? prefs.trackedKeywords.join(", ")
-        : "(none)";
-      await space.send(
-        `Got it — saved your macro preferences for this chat.\n` +
-          `Tracked keywords: ${keywordsPretty}\n` +
-          `Sentiment threshold: ${prefs.sentimentThreshold}`,
-      );
-    } catch (err) {
-      console.error(err);
-      if (isAlertFollowUp) {
-        await message.reply(
-          "Sorry — I couldn't analyze that follow-up right now.",
-        );
-      } else {
-        await space.send("Sorry — I couldn't update your preferences right now.");
-      }
-    } finally {
-      finishProcessingMessage(messageKey);
-    }
+      })
+      .catch((err) => {
+        console.error(`[iMessage] handler failed space=${spaceId}:`, err);
+        finishProcessingMessage(messageKey);
+      });
   }
 }
 

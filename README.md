@@ -96,7 +96,10 @@ npm start
 `npm start` runs one process that:
 
 1. **Reactive (iMessage)**: listens on Spectrum `app.messages`, extracts preferences with Grok, and replies.
-2. **Proactive (ZeroMQ)**: subscribes to `cpp_engine` headlines in the background, analyzes each with Grok, and pushes iMessage alerts when a user’s preferences match.
+2. **Follow-ups**: after a proactive alert, answer questions about that headline (e.g. “Why is this hawkish?”) via threaded `message.reply()`.
+3. **Proactive (ZeroMQ)**: subscribes to `cpp_engine` headlines in the background, analyzes each with Grok, and pushes iMessage alerts when a user’s preferences match.
+
+Outbound messages to the same chat are ordered so preference confirmations are not interrupted by a concurrent alert (see `TECHNICAL.md`).
 
 Start `cpp_engine` in another terminal so headlines are published:
 
@@ -119,6 +122,7 @@ Troubleshooting (preferences):
 
 - If you get `Got it — saved...` but `Tracked keywords: (none)` and `Sentiment threshold: 0.6`, the agent fell back to defaults (most commonly because `XAI_API_KEY` is missing/blank, or the LLM output wasn't parseable).
 - If you get `Sorry — I couldn't update your preferences right now.`, the LLM call failed (network/API/model error). Check the agent console logs for the error.
+- If an alert arrives before your “Got it — saved…” reply, restart the agent after `npm run build` — the agent holds alerts while your settings message is being processed so confirmations should arrive first.
 - If you get multiple identical replies for a single text, you likely have multiple `npm start` processes running at once. Stop extras (Ctrl+C) so only one agent instance is connected.
 - The agent also enforces a single-instance lock; if you try to start a second copy, it will exit and tell you which PID is already running.
 
@@ -136,6 +140,19 @@ Troubleshooting (alerts):
 - Headlines logged but no alert: preferences may not match (keywords or severity below threshold), or `XAI_API_KEY` is missing (analysis is skipped).
 - Console says `no user preferences yet`: send at least one iMessage to configure preferences first.
 - Console says `no cached conversation`: you must message the agent at least once per run so it can resolve the Spectrum `space` for outbound sends.
+
+### What to test (alert follow-ups)
+
+After you receive a proactive macro alert:
+
+1. Reply in the same chat with a question about that alert, e.g. `Why is this hawkish?` or `Summarize the whole report`.
+2. You should get a threaded analysis reply (not a “Got it — saved preferences” message).
+3. Follow-ups work for ~30 minutes after the alert; send a new preference message (e.g. “alert me on CPI”) if you want to change settings instead.
+
+Troubleshooting (follow-ups):
+
+- Got a preferences reply instead of analysis: phrase your message as a question, or include words like “why”, “summarize”, or “hawkish”. Messages like “alert me on CPI” are treated as preference updates.
+- “I don't have a recent alert in context”: no alert was stored for this chat yet, or the 30-minute context window expired.
 
 ### Debug-only: standalone ZeroMQ subscriber
 

@@ -91,10 +91,20 @@ The `ts_agent` main entrypoint runs a Spectrum server that listens to incoming m
 
 The `ts_agent` main process runs **two concurrent loops**:
 
-1. **Reactive (Spectrum)**: `for await` on `app.messages` — replies when a user configures preferences.
-2. **Proactive (ZeroMQ)**: a background `SUB` socket in the same process — analyzes headlines and calls `app.send(space, text)` when thresholds match.
+1. **Reactive (Spectrum)**: `for await` on `app.messages` — dispatches each inbound text to a per-space handler (non-blocking on the iterator).
+2. **Proactive (ZeroMQ)**: a background `SUB` socket in the same process — analyzes headlines and sends alerts when thresholds match.
 
 For debugging, inbound iMessages are logged with `space.id` and `sender.id`; ZMQ headlines are logged as `[ZMQ] headline: ...`.
+
+### Per-space outbound ordering (`spaceOutbound.ts`)
+
+`SpaceOutboundCoordinator` prevents races between user-driven replies and proactive alerts:
+
+- **Alert hold**: while an inbound message is handled for a `space.id`, proactive alerts to that space are deferred.
+- **FIFO queue**: all outbound work for a space runs through `spaceOutbound.run(spaceId, kind, fn)` with `kind` of `"user"` or `"alert"`.
+- **Re-check on send**: alert tasks re-read `userPreferences` immediately before `app.send`, so a settings change that finishes during a hold can still affect whether the alert fires.
+
+Inbound handlers use `void spaceOutbound.run(spaceId, "user", …)` so one slow Grok call does not block other conversations.
 
 ### In-memory preferences state
 
@@ -104,8 +114,19 @@ When a user sends a text message, `ts_agent` extracts macro trading preferences 
 - Key: `space.id` (conversation id)
 - Value: `{ trackedKeywords: string[], sentimentThreshold: number }`
 - `spacesById: Map<string, Space>` — caches the Spectrum `space` handle for proactive outbound sends (populated on each inbound message)
+- `lastAlertBySpace: Map<string, AlertContext>` — headline + Grok analysis for conversational follow-ups (~30 minute TTL)
 
 This is intentionally **ephemeral** (memory-only). Persisting to a DB can be added later once the preference schema stabilizes.
+
+### Alert follow-ups
+
+After a proactive alert is sent, the agent stores `AlertContext` for that `space.id`. On later inbound text:
+
+1. If there is recent alert context and the message looks like a **follow-up question** (e.g. ends with `?`, starts with “why”/“summarize”, mentions hawkish/dovish), it is **not** treated as a preference update.
+2. Grok receives the stored headline/analysis plus the user’s question.
+3. The response is sent with `message.reply()` so it threads in iMessage.
+
+Preference-shaped messages (e.g. “alert me on CPI”, “threshold 0.5”) still go through preference extraction even if alert context exists.
 
 ### LLM preference extraction
 
@@ -153,10 +174,8 @@ The repo streams macro headlines from C++ → Node over **PUB/SUB**, and the mai
 
 1. Parse JSON frame; dedupe by `ts` + headline (or headline alone) for ~2 minutes.
 2. Call Grok (`analyzeHeadlineWithLlm`) → `{ sentiment, severity, summary }`.
-3. For each `userPreferences` entry:
-   - **Keywords**: if `trackedKeywords` is non-empty, the headline must contain at least one (case-insensitive). If empty, no keyword filter.
-   - **Threshold**: alert when `severity >= sentimentThreshold` (lower threshold = more alerts).
-4. If matched, `app.send(space, alertText)` using the cached `spacesById` entry.
+3. For each `userPreferences` entry, enqueue `spaceOutbound.run(spaceId, "alert", …)` (waits if that space has an active alert hold).
+4. Inside the alert task, re-check keywords and `severity >= sentimentThreshold` against current preferences, then `app.send(space, alertText)` and store `lastAlertBySpace`.
 
 If no user has messaged since startup, preferences are empty and headlines are logged but not alerted. If preferences exist but `spacesById` lacks that `space.id`, the agent logs that the user must message first (Spectrum needs a cached conversation handle for outbound iMessage).
 
@@ -230,6 +249,7 @@ ZeroMQ is not a message broker; you must design for:
 - C++ entrypoint: `cpp_engine/src/main.cpp`
 - C++ build config: `cpp_engine/CMakeLists.txt`
 - TS entrypoint (Spectrum + ZMQ alerts): `ts_agent/src/index.ts`
+- TS per-space outbound ordering: `ts_agent/src/spaceOutbound.ts`
 - TS ZMQ debug CLI: `ts_agent/src/subscriber.ts`
 - TS build config: `ts_agent/tsconfig.json`
 - Node deps: `ts_agent/package.json`
