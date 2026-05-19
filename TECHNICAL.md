@@ -58,28 +58,112 @@ This matches modern Node.js ESM behavior while keeping the TypeScript compiler i
 ### Dependencies
 
 - `dotenv`: loads `.env` via `import "dotenv/config"`
+- `spectrum-ts`: Photon Spectrum SDK for unified messaging + iMessage provider
 - xAI (Grok): called via OpenAI-compatible HTTP endpoints using `fetch`
 - `zeromq`: Node bindings for ZeroMQ
 
 Security note: keep `XAI_API_KEY` on the agent side. Don’t pass the key over ZeroMQ.
 
-## ZeroMQ integration (intended)
+## Photon Spectrum (iMessage agent loop)
 
-The repo now includes a working **PUB/SUB** demo to stream macro headlines from C++ → Node. It’s intentionally a standalone CLI flow (not tied to any frontend/UI yet), so you can iterate on the agent behavior later.
+The `ts_agent` main entrypoint runs a Spectrum server that listens to incoming messages:
 
-### Current implementation (PUB/SUB headlines)
+- The SDK is `spectrum-ts`.
+- iMessage is enabled via the provider `imessage.config()`.
+- Incoming messages arrive on `app.messages` as `[space, message]` tuples.
 
-- **Publisher (C++)**: `cpp_engine` binds a `PUB` socket (default `tcp://127.0.0.1:5555`).
-  - The bind endpoint can be overridden by passing `argv[1]`.
-  - A simulated headline is sampled every 2 seconds.
-  - Only headlines matching the hardcoded macro keyword filter are published.
-- **Subscriber (TypeScript)**: `ts_agent` has a `SUB` process that connects to an endpoint (default `tcp://127.0.0.1:5555`) and logs matched macro headlines.
-  - Endpoint override: CLI arg `node dist/subscriber.js tcp://127.0.0.1:6000` (via `npm run sub -- ...`) or `ZMQ_ENDPOINT` env var.
+### Environment variables
 
-**Macro keyword filter (both sides)**
+**Spectrum (iMessage, required for `npm start`)**
 
-- Keywords (case-insensitive substring match): `FOMC`, `CPI`, `Rates`, `Powell`.
-- C++ filters before publish; TS filters again before logging.
+- `PROJECT_ID`
+- `PROJECT_SECRET` (or `SECRET_KEY`)
+
+**Grok (required for preference extraction and headline analysis)**
+
+- `XAI_API_KEY`
+- `XAI_BASE_URL` (optional, default `https://api.x.ai/v1`)
+- `GROK_MODEL` (optional; auto-fallback if unset)
+
+**ZeroMQ (optional)**
+
+- `ZMQ_ENDPOINT` (default `tcp://127.0.0.1:5555`; must match `cpp_engine` bind address)
+
+The `ts_agent` main process runs **two concurrent loops**:
+
+1. **Reactive (Spectrum)**: `for await` on `app.messages` — replies when a user configures preferences.
+2. **Proactive (ZeroMQ)**: a background `SUB` socket in the same process — analyzes headlines and calls `app.send(space, text)` when thresholds match.
+
+For debugging, inbound iMessages are logged with `space.id` and `sender.id`; ZMQ headlines are logged as `[ZMQ] headline: ...`.
+
+### In-memory preferences state
+
+When a user sends a text message, `ts_agent` extracts macro trading preferences using the configured LLM and stores them in-memory:
+
+- `userPreferences: Map<string, UserPreferences>`
+- Key: `space.id` (conversation id)
+- Value: `{ trackedKeywords: string[], sentimentThreshold: number }`
+- `spacesById: Map<string, Space>` — caches the Spectrum `space` handle for proactive outbound sends (populated on each inbound message)
+
+This is intentionally **ephemeral** (memory-only). Persisting to a DB can be added later once the preference schema stabilizes.
+
+### LLM preference extraction
+
+Preferences are extracted by calling an **OpenAI-compatible** chat completions endpoint.
+
+- Defaults to xAI (Grok):
+  - `XAI_BASE_URL` (default `https://api.x.ai/v1`)
+  - `XAI_API_KEY`
+  - `GROK_MODEL` (optional)
+
+If `GROK_MODEL` is unset, the agent tries `grok-4.3` first (if available on your account) and will auto-fallback by querying `/models` if the chosen model id is not available.
+
+If the LLM call fails (or no API key is set), the agent falls back to defaults.
+
+#### Notes on "Sorry" vs "Got it" replies
+
+- A reply like "Sorry — I couldn't update your preferences right now." indicates the preference extraction step threw an error (network issue, non-OK API response, etc.).
+- A "Got it — saved…" reply with `(none)` and `0.6` indicates the agent used defaults (commonly because `XAI_API_KEY` is missing/blank, the LLM returned empty content, or the JSON schema didn’t match expectations).
+- The agent also dedupes duplicate inbound events when Spectrum delivers the same iMessage more than once, to avoid repeated replies.
+
+#### Single-instance lock
+
+To prevent accidentally running two agents at once (which would cause duplicate replies), `ts_agent` creates a lock file in your OS temp directory (macOS example: `/var/folders/...`). If a second instance starts and sees the lock held by a live PID, it exits with an error and prints the PID to stop.
+
+## ZeroMQ integration
+
+The repo streams macro headlines from C++ → Node over **PUB/SUB**, and the main agent (`index.ts`) consumes them in-process alongside Spectrum.
+
+### Publisher (C++)
+
+- `cpp_engine` binds a `PUB` socket (default `tcp://127.0.0.1:5555`).
+- Bind endpoint override: `argv[1]`.
+- A simulated headline is sampled every 2 seconds.
+- Only headlines matching a **hardcoded** macro keyword filter are published.
+
+**C++ macro keyword filter** (case-insensitive substring): `FOMC`, `CPI`, `Rates`, `Powell`.
+
+### Subscriber (TypeScript, main agent)
+
+- `index.ts` starts `runZmqHeadlineSubscriber()` concurrently with the Spectrum message loop (same Node process).
+- Connects via `ZMQ_ENDPOINT` (default `tcp://127.0.0.1:5555`).
+- Accepts any `type: "headline"` JSON frame (no second hardcoded keyword filter in the main agent).
+
+**Headline pipeline**
+
+1. Parse JSON frame; dedupe by `ts` + headline (or headline alone) for ~2 minutes.
+2. Call Grok (`analyzeHeadlineWithLlm`) → `{ sentiment, severity, summary }`.
+3. For each `userPreferences` entry:
+   - **Keywords**: if `trackedKeywords` is non-empty, the headline must contain at least one (case-insensitive). If empty, no keyword filter.
+   - **Threshold**: alert when `severity >= sentimentThreshold` (lower threshold = more alerts).
+4. If matched, `app.send(space, alertText)` using the cached `spacesById` entry.
+
+If no user has messaged since startup, preferences are empty and headlines are logged but not alerted. If preferences exist but `spacesById` lacks that `space.id`, the agent logs that the user must message first (Spectrum needs a cached conversation handle for outbound iMessage).
+
+### Debug subscriber (`subscriber.ts`)
+
+- `npm run sub` runs a **standalone** `SUB` CLI that only logs headlines matching the same hardcoded macro keywords as C++.
+- Useful for verifying ZMQ without Spectrum, Grok, or iMessage.
 
 **Message framing**
 
@@ -145,6 +229,7 @@ ZeroMQ is not a message broker; you must design for:
 
 - C++ entrypoint: `cpp_engine/src/main.cpp`
 - C++ build config: `cpp_engine/CMakeLists.txt`
-- TS entrypoint: `ts_agent/src/index.ts`
+- TS entrypoint (Spectrum + ZMQ alerts): `ts_agent/src/index.ts`
+- TS ZMQ debug CLI: `ts_agent/src/subscriber.ts`
 - TS build config: `ts_agent/tsconfig.json`
 - Node deps: `ts_agent/package.json`

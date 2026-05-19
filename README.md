@@ -41,7 +41,7 @@ Current macro keywords (case-insensitive substring match): `FOMC`, `CPI`, `Rates
 You can override the bind endpoint:
 
 ```bash
-./cpp_engine/build/cpp_engine tcp://127.0.0.1:6000
+./cpp_engine/build/cpp_engine tcp://127.0.0.1:5555
 ```
 
 Notes:
@@ -75,7 +75,16 @@ cp .env.example .env
 
 Set:
 
-- `XAI_API_KEY=...`
+- `XAI_API_KEY=...` (required for preference extraction and headline analysis)
+
+For Photon Spectrum (iMessage):
+
+- `PROJECT_ID=...`
+- `PROJECT_SECRET=...`
+
+Optional:
+
+- `ZMQ_ENDPOINT=...` (default `tcp://127.0.0.1:5555`; must match `cpp_engine` bind address)
 
 ### Build & run
 
@@ -84,9 +93,53 @@ npm run build
 npm start
 ```
 
-### Subscribe to macro headlines (ZeroMQ SUB)
+`npm start` runs one process that:
 
-In a separate terminal (while `cpp_engine` is running):
+1. **Reactive (iMessage)**: listens on Spectrum `app.messages`, extracts preferences with Grok, and replies.
+2. **Proactive (ZeroMQ)**: subscribes to `cpp_engine` headlines in the background, analyzes each with Grok, and pushes iMessage alerts when a user’s preferences match.
+
+Start `cpp_engine` in another terminal so headlines are published:
+
+```bash
+./cpp_engine/build/cpp_engine
+```
+
+### What to test (iMessage preferences)
+
+Checklist:
+
+1. Start `cpp_engine` (see above).
+2. Start the agent: `cd ts_agent && npm run build && npm start`
+3. In the Photon dashboard, find the iMessage “line” / phone number for your project.
+4. From your iPhone, send an iMessage (blue bubble) to that number (e.g. “Alert me on CPI and FOMC, threshold 0.5”).
+5. You should see a console log like: `[iMessage] space=... sender=...: <your text>`
+6. You should receive a reply confirming saved preferences.
+
+Troubleshooting (preferences):
+
+- If you get `Got it — saved...` but `Tracked keywords: (none)` and `Sentiment threshold: 0.6`, the agent fell back to defaults (most commonly because `XAI_API_KEY` is missing/blank, or the LLM output wasn't parseable).
+- If you get `Sorry — I couldn't update your preferences right now.`, the LLM call failed (network/API/model error). Check the agent console logs for the error.
+- If you get multiple identical replies for a single text, you likely have multiple `npm start` processes running at once. Stop extras (Ctrl+C) so only one agent instance is connected.
+- The agent also enforces a single-instance lock; if you try to start a second copy, it will exit and tell you which PID is already running.
+
+### What to test (proactive macro alerts)
+
+After saving preferences (above), leave `npm start` running with `cpp_engine` publishing:
+
+1. Watch the agent console for `[ZMQ] headline: ...` when a headline is received.
+2. If the headline matches your keywords and Grok’s **severity** is at or above your **sentiment threshold**, you should get a proactive iMessage (no new inbound message required).
+3. Lower threshold → more alerts; higher threshold → fewer.
+
+Troubleshooting (alerts):
+
+- No `[ZMQ]` logs: check `cpp_engine` is running and `ZMQ_ENDPOINT` matches its bind address.
+- Headlines logged but no alert: preferences may not match (keywords or severity below threshold), or `XAI_API_KEY` is missing (analysis is skipped).
+- Console says `no user preferences yet`: send at least one iMessage to configure preferences first.
+- Console says `no cached conversation`: you must message the agent at least once per run so it can resolve the Spectrum `space` for outbound sends.
+
+### Debug-only: standalone ZeroMQ subscriber
+
+`npm run sub` runs `subscriber.ts` alone — it only logs headlines that pass the hardcoded C++ macro keyword filter. Use it to verify ZMQ wiring without Spectrum or Grok:
 
 ```bash
 cd ts_agent
@@ -94,8 +147,8 @@ npm run build
 npm run sub
 ```
 
-If you ran `cpp_engine` on a non-default port, pass the endpoint through to the subscriber:
+If `cpp_engine` uses a non-default port:
 
 ```bash
-npm run sub -- tcp://127.0.0.1:6000
+npm run sub -- tcp://127.0.0.1:5555
 ```
