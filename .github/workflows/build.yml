@@ -1,0 +1,63 @@
+name: build
+
+# Build both components on every push and pull request so we catch
+# compile/type errors before they land.
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpp_engine:
+    name: Build cpp_engine (C++20 + ZeroMQ)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cppzmq, cpp-httplib and nlohmann/json are header-only and pulled in by
+      # CMake FetchContent. We only need the native libraries here: libzmq (the
+      # ZeroMQ core), OpenSSL (HTTPS for --live mode), and pkg-config so cppzmq
+      # can locate libzmq.
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            build-essential \
+            pkg-config \
+            libzmq3-dev \
+            libssl-dev
+
+      # FetchContent clones the header-only deps at configure time; cache them
+      # keyed on the CMakeLists so we don't re-clone on every run.
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: cpp_engine/build/_deps
+          key: ${{ runner.os }}-fetchcontent-${{ hashFiles('cpp_engine/CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S cpp_engine -B cpp_engine/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build cpp_engine/build
+
+  ts_agent:
+    name: Build ts_agent (Node.js + TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts_agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ts_agent/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
