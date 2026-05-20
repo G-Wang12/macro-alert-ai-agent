@@ -48,14 +48,16 @@ The engine is built around a small data-source abstraction so the headline feed 
 - **`IMarketDataSource.hpp`** — abstract interface with one method: `std::optional<std::string> nextHeadline()`. Returning `std::nullopt` means "no headline available right now."
 - **`SimulatedDataSource.hpp`** — implements the interface with a built-in vector of mock headlines, rotated sequentially. It self-paces: it returns a headline at most once every 2 seconds and `std::nullopt` in between (via a `std::chrono::steady_clock` timestamp).
 - **`LiveRestDataSource.hpp`** — implements the interface against the Finnhub REST news API. Its constructor starts a background `std::thread` that polls every 2 seconds (cpp-httplib over HTTPS); an `std::atomic<bool>` controls the thread's lifecycle and the destructor joins it. New headlines (de-duplicated by article `id` via an `std::unordered_set<int>`) are pushed onto a `std::queue<std::string>` guarded by a `std::mutex`. JSON parsing happens outside the lock; only the push is inside it. `nextHeadline()` pops the oldest queued headline, or returns `std::nullopt` when the queue is empty.
-- **`MacroFilter.hpp`** — holds the macro keyword list and exposes `bool matches(std::string_view)` using a case-insensitive substring search (C++20 `std::ranges` algorithms). Substring matching means e.g. `Rates` matches "acceleRATES" and `Fed` matches "FedEx"; the downstream LLM acts as a second filter.
+- **`MacroFilter.hpp`** — holds a keyword list and exposes `bool matches(std::string_view)` using a case-insensitive substring search (C++20 `std::ranges` algorithms). Substring matching means e.g. `Rates` matches "acceleRATES" and `Fed` matches "FedEx"; the downstream LLM acts as a second filter.
+- **`SharedFilter.hpp`** — a thread-safe holder for the *active* `MacroFilter`. The main loop reads it once per headline; the background `FilterSubscriber` swaps in a new one when the agent pushes an updated term set. Built-in macro keywords are the constructor default and the fallback used whenever the pushed set is empty. Reads/writes are guarded by a `std::mutex` around a `std::shared_ptr<const MacroFilter>` (the lock is held only to copy/swap the pointer, not during matching).
+- **`FilterSubscriber.hpp`** — owns a background `std::thread` running a `SUB` socket on `FILTER_ENDPOINT` (default `tcp://127.0.0.1:5556`). It parses `{"type":"filterset","terms":[...]}` frames from the agent and calls `SharedFilter::update()`, skipping no-op updates (the agent heartbeats the same set). `recv` uses a 200 ms `RCVTIMEO` so the thread can observe its stop flag.
 - **`ZmqPublisher.hpp`** — owns the `zmq::context_t` + `zmq::socket_t` (`PUB`), binds in its constructor, and serializes each headline to the JSON wire frame in `publishHeadline()`.
 - **`DotEnv.hpp`** — minimal `.env` loader (`KEY=VALUE`, `#` comments, optional quotes/`export`). It uses `setenv(..., overwrite=0)` so a real shell variable always wins over the file.
 
-`main.cpp` wires these together: it loads `.env`, parses flags (`--simulate`/`--live` + optional endpoint), constructs the chosen source behind a `std::unique_ptr<IMarketDataSource>`, the `MacroFilter`, and the `ZmqPublisher`, then runs the main loop:
+`main.cpp` wires these together: it loads `.env`, parses flags (`--simulate`/`--live` + optional endpoint), constructs the chosen source behind a `std::unique_ptr<IMarketDataSource>`, the `SharedFilter` (seeded with the macro defaults), the `FilterSubscriber`, and the `ZmqPublisher`, then runs the main loop:
 
 1. Call `source->nextHeadline()`.
-2. If a headline is returned: run it through `MacroFilter`, publish matches, and immediately loop again (draining any queued backlog).
+2. If a headline is returned: run it through the active filter (`filter.current()->matches(...)`), publish matches, and immediately loop again (draining any queued backlog).
 3. If `std::nullopt`: sleep 50 ms to avoid busy-waiting, then loop.
 
 Pacing therefore lives in the *source* (the simulated source's 2 s cadence, the live source's 2 s poll), not the loop — so live headlines drain as fast as they arrive while idle CPU stays near zero. Startup errors (bad flags, bind failure, missing `FINNHUB_API_KEY` under `--live`) are fatal and exit non-zero; per-iteration errors are logged and the loop continues.
@@ -175,16 +177,29 @@ To prevent accidentally running two agents at once (which would cause duplicate 
 
 ## ZeroMQ integration
 
-The repo streams macro headlines from C++ → Node over **PUB/SUB**, and the main agent (`index.ts`) consumes them in-process alongside Spectrum.
+The repo uses **two** ZeroMQ PUB/SUB channels in opposite directions:
+
+1. **Headlines** (C++ → Node): the engine publishes matching headlines; the agent consumes them in-process alongside Spectrum.
+2. **Filter set** (Node → C++): the agent publishes the union of all users' interests so the engine knows what to forward (see [Filter-set channel](#filter-set-channel-node--c) below).
 
 ### Publisher (C++)
 
 - `cpp_engine` binds a `PUB` socket (default `tcp://127.0.0.1:5555`).
 - Bind endpoint override: positional CLI argument (any non-flag arg), e.g. `./cpp_engine --live tcp://127.0.0.1:5556`.
 - Source selected by flag: `--simulate` (default; mock headlines every 2 s) or `--live` (Finnhub REST poll every 2 s; needs `FINNHUB_API_KEY` from `cpp_engine/.env` or the environment).
-- Only headlines matching a **hardcoded** macro keyword filter (`MacroFilter`) are published.
+- Only headlines matching the **active** keyword filter are published. The filter defaults to the built-in macro keyword list below, but is replaced at runtime by the agent's filter set when one is connected.
 
-**C++ macro keyword filter** (case-insensitive substring): `FOMC`, `CPI`, `PCE`, `inflation`, `Fed`, `Powell`, `Rates`, `ECB`, `Treasury`, `yield`, `jobs`, `payroll`, `unemployment`, `GDP`, `recession`, `tariff`, `stimulus`, `central bank`, `bond`.
+**Built-in macro keyword filter** (case-insensitive substring; the default/fallback): `FOMC`, `CPI`, `PCE`, `inflation`, `Fed`, `Powell`, `Rates`, `ECB`, `Treasury`, `yield`, `jobs`, `payroll`, `unemployment`, `GDP`, `recession`, `tariff`, `stimulus`, `central bank`, `bond`.
+
+### Filter-set channel (Node → C++)
+
+User preferences (tracked keywords + watchlist tickers) live only in the agent, so the agent pushes them to the engine to control what gets forwarded:
+
+- The agent **binds** a `PUB` socket on `FILTER_ENDPOINT` (default `tcp://127.0.0.1:5556`); the engine's `FilterSubscriber` **connects** a `SUB`.
+- Frame: `{"type":"filterset","terms":[...]}`, where `terms` is the case-insensitively de-duplicated, sorted union of every `userPreferences` entry's `trackedKeywords` + `watchlist`.
+- The agent publishes on every preference change **and** on a ~5 s heartbeat (`FILTER_HEARTBEAT_MS`). Because PUB/SUB drops messages to absent subscribers, the heartbeat is what lets a late/reconnecting engine converge; the engine ignores no-op repeats.
+- An **empty** term set makes the engine fall back to its built-in macro keywords (e.g. no users yet). This is consistent with the agent's own "empty keyword set ⇒ match all" rule, and since the agent skips analysis entirely when it has no preferences, no Grok calls are wasted.
+- This channel only decides what the engine *forwards*. Final per-user routing (which chat gets an alert) is still done in the agent's `shouldAlertUser`, which matches each headline against that user's `trackedKeywords` ∪ `watchlist` and the severity threshold.
 
 ### Subscriber (TypeScript, main agent)
 

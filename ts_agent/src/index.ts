@@ -11,12 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Subscriber } from "zeromq";
+import { Publisher, Subscriber } from "zeromq";
 import { SpaceOutboundCoordinator } from "./spaceOutbound.js";
 
 type UserPreferences = {
   trackedKeywords: string[];
   sentimentThreshold: number; // 0..1
+  watchlist?: string[]; // explicit stock tickers the user mentioned
 };
 
 type HeadlineMessage = {
@@ -53,6 +54,13 @@ const userPreferences = new Map<string, UserPreferences>();
 const spacesById = new Map<string, Space>();
 const lastAlertBySpace = new Map<string, AlertContext>();
 const spaceOutbound = new SpaceOutboundCoordinator();
+
+// Reverse channel to cpp_engine: we PUB the union of every user's tracked
+// keywords + watchlist tickers so the engine narrows what it forwards. The
+// engine subscribes and rebuilds its filter at runtime (see FilterSubscriber).
+let filterPublisher: Publisher | null = null;
+let lastPublishedFilterSet = "";
+const FILTER_HEARTBEAT_MS = 5 * 1000;
 
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
 const HEADLINE_DEDUPE_TTL_MS = 2 * 60 * 1000;
@@ -174,6 +182,7 @@ function normalizePreferences(maybe: unknown): UserPreferences | null {
 
   const tracked = obj.trackedKeywords;
   const threshold = obj.sentimentThreshold;
+  const watch = obj.watchlist;
 
   const trackedKeywords = Array.isArray(tracked)
     ? tracked
@@ -182,11 +191,18 @@ function normalizePreferences(maybe: unknown): UserPreferences | null {
         .filter(Boolean)
     : [];
 
+  const watchlist = Array.isArray(watch)
+    ? watch
+        .filter((x): x is string => typeof x === "string")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean)
+    : [];
+
   let sentimentThreshold = typeof threshold === "number" ? threshold : 0.6;
   if (!Number.isFinite(sentimentThreshold)) sentimentThreshold = 0.6;
   sentimentThreshold = Math.max(0, Math.min(1, sentimentThreshold));
 
-  return { trackedKeywords, sentimentThreshold };
+  return { trackedKeywords, sentimentThreshold, watchlist };
 }
 
 async function listModelIds(
@@ -369,7 +385,10 @@ function shouldAlertUser(
   analysis: HeadlineAnalysis,
   prefs: UserPreferences,
 ): boolean {
-  if (!matchesUserKeywords(headline, prefs.trackedKeywords)) return false;
+  // Watchlist tickers act as additional match terms alongside macro keywords,
+  // so news about a watched stock triggers an alert even if no keyword matches.
+  const matchTerms = [...prefs.trackedKeywords, ...(prefs.watchlist ?? [])];
+  if (!matchesUserKeywords(headline, matchTerms)) return false;
   return analysis.severity >= prefs.sentimentThreshold;
 }
 
@@ -621,15 +640,17 @@ async function extractPreferencesWithLlm(
     console.warn(
       "ts_agent: XAI_API_KEY is not set (or is empty) — using default preferences.",
     );
-    return { trackedKeywords: [], sentimentThreshold: 0.6 };
+    return { trackedKeywords: [], sentimentThreshold: 0.6, watchlist: [] };
   }
 
   const system =
     "You extract macro trading alert preferences from user messages. " +
-    "Return ONLY valid JSON with keys: trackedKeywords (string[]), sentimentThreshold (number 0..1). " +
+    "Return ONLY valid JSON with keys: trackedKeywords (string[]), sentimentThreshold (number 0..1), watchlist (string[]). " +
     "trackedKeywords should be macro/news triggers like CPI, FOMC, rates, Powell, NFP, inflation. " +
     "sentimentThreshold is a sensitivity value: lower = more alerts, higher = fewer alerts. " +
-    "If user provides none, use trackedKeywords=[] and sentimentThreshold=0.6.";
+    "watchlist should contain any explicit stock tickers the user mentions (e.g. AAPL, TSLA, NVDA), uppercased; " +
+    "do not invent tickers — only include ones the user actually names. " +
+    "If user provides none, use trackedKeywords=[], sentimentThreshold=0.6, watchlist=[].";
 
   let content: string;
   try {
@@ -655,6 +676,7 @@ async function extractPreferencesWithLlm(
       normalized ?? {
         trackedKeywords: [],
         sentimentThreshold: 0.6,
+        watchlist: [],
       }
     );
   } catch (err) {
@@ -662,8 +684,68 @@ async function extractPreferencesWithLlm(
       "ts_agent: Failed to parse LLM JSON — using default preferences.",
       err,
     );
-    return { trackedKeywords: [], sentimentThreshold: 0.6 };
+    return { trackedKeywords: [], sentimentThreshold: 0.6, watchlist: [] };
   }
+}
+
+// Union of every user's tracked keywords + watchlist tickers, deduped
+// case-insensitively and sorted (stable order lets the engine cheaply detect
+// "no change"). This is exactly the set of terms the engine needs to forward.
+function computeFilterTerms(): string[] {
+  const bySeen = new Map<string, string>(); // lowercase -> first-seen casing
+  for (const prefs of userPreferences.values()) {
+    const terms = [...prefs.trackedKeywords, ...(prefs.watchlist ?? [])];
+    for (const raw of terms) {
+      const term = raw.trim();
+      if (!term) continue;
+      const key = term.toLowerCase();
+      if (!bySeen.has(key)) bySeen.set(key, term);
+    }
+  }
+  return Array.from(bySeen.values()).sort((a, b) => a.localeCompare(b));
+}
+
+async function publishFilterSet(): Promise<void> {
+  if (!filterPublisher) return;
+  const terms = computeFilterTerms();
+  const payload = JSON.stringify({ type: "filterset", terms });
+  const changed = payload !== lastPublishedFilterSet;
+  lastPublishedFilterSet = payload;
+  try {
+    // Always send (heartbeat lets a reconnecting engine catch up); only log on
+    // an actual change so the heartbeat stays quiet.
+    await filterPublisher.send(payload);
+    if (changed) {
+      console.log(
+        `[filter] pushed ${terms.length} term(s) to engine: ` +
+          (terms.length ? terms.join(", ") : "(empty — engine uses defaults)"),
+      );
+    }
+  } catch (err) {
+    console.error("[filter] failed to publish filter set:", err);
+  }
+}
+
+async function startFilterPublisher(): Promise<void> {
+  const endpoint = process.env.FILTER_ENDPOINT ?? "tcp://127.0.0.1:5556";
+  try {
+    const pub = new Publisher();
+    await pub.bind(endpoint);
+    filterPublisher = pub;
+    console.log(`ts_agent: filter publisher bound on ${endpoint}`);
+  } catch (err) {
+    console.error(
+      `ts_agent: failed to bind filter publisher on ${endpoint} — ` +
+        "engine will fall back to its built-in macro filter.",
+      err,
+    );
+    return;
+  }
+
+  await publishFilterSet();
+  setInterval(() => {
+    void publishFilterSet();
+  }, FILTER_HEARTBEAT_MS);
 }
 
 async function main(): Promise<void> {
@@ -694,13 +776,34 @@ async function main(): Promise<void> {
 
   console.log("ts_agent: Spectrum app started; waiting for messages...");
 
+  void startFilterPublisher().catch((err) => {
+    console.error("ts_agent: filter publisher failed to start:", err);
+  });
+
   void runZmqHeadlineSubscriber(app).catch((err) => {
     console.error("ts_agent: ZeroMQ subscriber exited:", err);
   });
 
   for await (const [space, message] of app.messages) {
-    if (message.platform !== "iMessage") continue;
-    if (message.content.type !== "text") continue;
+    // Diagnostic: log every inbound event so a non-iMessage / non-text message
+    // (e.g. a green-bubble SMS, typing indicator, reaction) is visible instead
+    // of being dropped silently.
+    console.log(
+      `[iMessage] inbound event platform=${String(message.platform)} ` +
+        `contentType=${String(message.content?.type)} space=${space.id}`,
+    );
+    if (message.platform !== "iMessage") {
+      console.log(
+        `[iMessage] skipped: platform is '${String(message.platform)}', not 'iMessage'`,
+      );
+      continue;
+    }
+    if (message.content.type !== "text") {
+      console.log(
+        `[iMessage] skipped: content type is '${String(message.content.type)}', not 'text'`,
+      );
+      continue;
+    }
 
     const text = message.content.text;
     const spaceId = space.id;
@@ -768,13 +871,20 @@ async function main(): Promise<void> {
 
           const prefs = await extractPreferencesWithLlm(text);
           userPreferences.set(spaceId, prefs);
+          // Preferences changed — push the new union to the engine so it starts
+          // forwarding headlines for any newly tracked keywords / watchlist.
+          void publishFilterSet();
 
           const keywordsPretty = prefs.trackedKeywords.length
             ? prefs.trackedKeywords.join(", ")
             : "(none)";
+          const watchlistPretty = prefs.watchlist?.length
+            ? prefs.watchlist.join(", ")
+            : "(none)";
           await space.send(
             `Got it — saved your macro preferences for this chat.\n` +
               `Tracked keywords: ${keywordsPretty}\n` +
+              `Watchlist: ${watchlistPretty}\n` +
               `Sentiment threshold: ${prefs.sentimentThreshold}`,
           );
         } catch (err) {

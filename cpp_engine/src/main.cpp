@@ -1,7 +1,9 @@
 #include "DotEnv.hpp"
+#include "FilterSubscriber.hpp"
 #include "IMarketDataSource.hpp"
 #include "LiveRestDataSource.hpp"
 #include "MacroFilter.hpp"
+#include "SharedFilter.hpp"
 #include "SimulatedDataSource.hpp"
 #include "ZmqPublisher.hpp"
 
@@ -108,13 +110,27 @@ int main(int argc, char **argv)
         const CliArgs args = parse_args(argc, argv);
 
         auto source = make_source(args.mode);
-        MacroFilter filter{{
+
+        // Built-in macro baseline. Used standalone, and as the fallback whenever
+        // the agent has no user interests to push (see SharedFilter).
+        SharedFilter filter{{
             "FOMC", "CPI", "PCE", "inflation",
             "Fed", "Powell", "Rates", "ECB",
             "Treasury", "yield", "jobs", "payroll",
             "unemployment", "GDP", "recession",
             "tariff", "stimulus", "central bank", "bond",
         }};
+
+        // Reverse channel: the agent pushes the union of all users' tracked
+        // keywords + watchlist tickers here, narrowing what we forward so a
+        // watched ticker reaches the agent. Override with FILTER_ENDPOINT.
+        const char *filterEnv = std::getenv("FILTER_ENDPOINT");
+        const std::string filterEndpoint =
+            (filterEnv != nullptr && *filterEnv != '\0')
+                ? std::string(filterEnv)
+                : "tcp://127.0.0.1:5556";
+        FilterSubscriber filterSub{filterEndpoint, filter};
+
         ZmqPublisher publisher{args.endpoint};
 
         // PUB slow-joiner: give subscribers a moment to connect before the first send.
@@ -137,7 +153,7 @@ int main(int argc, char **argv)
                     continue;
                 }
 
-                if (filter.matches(*headline))
+                if (filter.current()->matches(*headline))
                 {
                     publisher.publishHeadline(*headline);
                     std::cout << "published: " << *headline << "\n";

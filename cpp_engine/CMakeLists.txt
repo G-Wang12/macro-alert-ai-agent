@@ -8,6 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
 
+# std::thread (LiveRestDataSource worker, FilterSubscriber) needs pthreads on Linux.
+find_package(Threads REQUIRED)
+
 # cppzmq = C++ bindings for ZeroMQ (header-only)
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "Build cppzmq tests/examples" FORCE)
 FetchContent_Declare(
@@ -51,4 +54,5 @@ target_link_libraries(cpp_engine PRIVATE
   cppzmq
   httplib::httplib
   nlohmann_json::nlohmann_json
+  Threads::Threads
 )

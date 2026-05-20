@@ -25,6 +25,15 @@ public:
               "China announces targeted stimulus; industrial metals rise",
               "MSFT cloud growth accelerates; upbeat guidance lifts tech",
               "Banking sector dips on renewed concerns over CRE exposure",
+              // Single-stock headlines (no macro keyword) for testing watchlists.
+              "GOOGL slides after antitrust ruling threatens ad business",
+              "AMZN holiday sales smash records; cloud margins expand",
+              "META unveils new AI assistant; shares rally 7% after the bell",
+              "AMD wins major data-center deal, taking share from NVDA",
+              "JPM tops estimates as net interest income climbs to a record",
+              "DIS streaming losses narrow as subscriber growth returns",
+              "COIN surges as crypto trading volumes spike to yearly high",
+              "PLTR jumps on raised guidance and new government contracts",
           }
     {
     }

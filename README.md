@@ -5,7 +5,7 @@ Dual-language starter repo with:
 - `cpp_engine/`: a C++20 engine built with CMake and linked to ZeroMQ (libzmq + cppzmq)
 - `ts_agent/`: a Node.js + TypeScript agent using `zeromq`, xAI (Grok), and `dotenv`
 
-For implementation details (build/linking choices, intended ZeroMQ protocol), see `TECHNICAL.md`.
+For implementation details (build/linking choices, intended ZeroMQ protocol), see `TECHNICAL.md`. For what end users should text the agent (preferences, watchlist, follow-ups), see `MESSAGING.md`.
 
 ## Repository layout
 
@@ -37,7 +37,7 @@ cmake --build cpp_engine/build
 ./cpp_engine/build/cpp_engine
 ```
 
-`cpp_engine` reads headlines from a data source, keeps only those matching a hardcoded macro keyword filter, and publishes the matches over ZeroMQ `PUB` (default `tcp://127.0.0.1:5555`) as JSON frames.
+`cpp_engine` reads headlines from a data source, keeps only those matching its macro keyword filter, and publishes the matches over ZeroMQ `PUB` (default `tcp://127.0.0.1:5555`) as JSON frames. The filter starts from a built-in macro keyword list but is **overridden at runtime** by the agent, which pushes the union of all users' tracked keywords + watchlist tickers (see [Dynamic filter sync](#dynamic-filter-sync)); with no agent connected it keeps the built-in list.
 
 It supports two data sources, selected by flag:
 
@@ -112,6 +112,7 @@ For Photon Spectrum (iMessage):
 Optional:
 
 - `ZMQ_ENDPOINT=...` (default `tcp://127.0.0.1:5555`; must match `cpp_engine` bind address)
+- `FILTER_ENDPOINT=...` (default `tcp://127.0.0.1:5556`; must match `cpp_engine`'s `FILTER_ENDPOINT`). The agent binds this and pushes the union of all users' tracked keywords + watchlist tickers so the engine forwards headlines for watched tickers — see [Dynamic filter sync](#dynamic-filter-sync).
 
 ### Build & run
 
@@ -133,6 +134,34 @@ Start `cpp_engine` in another terminal so headlines are published:
 ```bash
 ./cpp_engine/build/cpp_engine
 ```
+
+### Dynamic filter sync
+
+The engine can't know about users on its own, so the **agent tells it what to
+watch**. This is a second ZeroMQ channel, in the reverse direction from
+headlines:
+
+- The agent **binds** a PUB socket on `FILTER_ENDPOINT` (default
+  `tcp://127.0.0.1:5556`) and publishes a *filter set* — the de-duplicated union
+  of every user's `trackedKeywords` + `watchlist` tickers:
+
+  ```json
+  { "type": "filterset", "terms": ["CPI", "FOMC", "TSLA", "NVDA"] }
+  ```
+
+- The engine **subscribes** and rebuilds its keyword filter at runtime, so it
+  forwards exactly what at least one user cares about (and nothing else, which
+  keeps Grok analysis volume down). An **empty** set falls back to the engine's
+  built-in macro keyword list.
+
+The agent republishes whenever preferences change **and** on a ~5s heartbeat, so
+an engine that starts late or reconnects converges to the current set within one
+interval (ZeroMQ PUB/SUB does not replay missed messages). Per-user routing is
+still done by the agent in `shouldAlertUser`; the filter set only controls which
+headlines the engine bothers to forward.
+
+This is what makes the **watchlist** work end-to-end: a ticker you mention is
+pushed to the engine, which then forwards headlines mentioning it.
 
 ### What to test (iMessage preferences)
 
@@ -158,8 +187,30 @@ Troubleshooting (preferences):
 After saving preferences (above), leave `npm start` running with `cpp_engine` publishing:
 
 1. Watch the agent console for `[ZMQ] headline: ...` when a headline is received.
-2. If the headline matches your keywords and Grok’s **severity** is at or above your **sentiment threshold**, you should get a proactive iMessage (no new inbound message required).
+2. If the headline matches your keywords **or watchlist tickers** and Grok’s **severity** is at or above your **sentiment threshold**, you should get a proactive iMessage (no new inbound message required).
 3. Lower threshold → more alerts; higher threshold → fewer.
+
+#### Testing the watchlist specifically
+
+With both `cpp_engine` and the agent running, the agent pushes your watchlist
+tickers to the engine (see [Dynamic filter sync](#dynamic-filter-sync)), so the
+engine forwards headlines that mention them:
+
+1. Text the agent `watch TSLA, threshold 0.3` (low threshold so severity passes).
+   The agent console logs `[filter] pushed N term(s) to engine: ..., TSLA`.
+2. In `--simulate` mode the engine cycles through a built-in `TSLA deliveries
+   miss estimates...` headline; once your watchlist reaches the engine it starts
+   forwarding it, and you should get an alert. (Before you set a watchlist, that
+   ticker-only headline is dropped by the macro filter.)
+
+To exercise the agent's matching **in isolation** (no engine, any headline),
+stop `cpp_engine` and use the debug publisher to inject one directly, bypassing
+the filter entirely:
+
+```bash
+cd ts_agent && npm run build
+npm run pub -- "TSLA tumbles 8% on weak deliveries"
+```
 
 Troubleshooting (alerts):
 
@@ -196,3 +247,21 @@ If `cpp_engine` uses a non-default port:
 ```bash
 npm run sub -- tcp://127.0.0.1:5555
 ```
+
+### Debug-only: standalone ZeroMQ publisher
+
+`npm run pub` runs `testPublisher.ts` — it **binds** a PUB socket and emits a
+headline frame in the same JSON shape as `cpp_engine`, but **without** the macro
+keyword filter. Use it to feed the agent arbitrary headlines (e.g. ticker-only
+news for watchlist testing):
+
+```bash
+cd ts_agent
+npm run build
+npm run pub -- "TSLA tumbles 8% on weak deliveries"
+npm run pub -- "Fed holds; NVDA pops" tcp://127.0.0.1:5555   # optional endpoint
+```
+
+Because it binds the endpoint, stop `cpp_engine` first (only one process can
+bind). Start the agent (`npm start`) before publishing so its subscriber is
+connected.

@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc -p .",
     "start": "node dist/index.js",
-    "sub": "node dist/subscriber.js"
+    "sub": "node dist/subscriber.js",
+    "pub": "node dist/testPublisher.js",
+    "info": "node dist/imessageInfo.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
