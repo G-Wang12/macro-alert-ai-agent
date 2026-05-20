@@ -21,13 +21,16 @@ That separation keeps each language doing what it’s good at while still allowi
 
 ### Dependency model
 
-- `cpp_engine/CMakeLists.txt` uses CMake `FetchContent` to fetch **cppzmq** at configure time.
-- **libzmq is not vendored** by this repo: you install it via your OS package manager (e.g. Homebrew on macOS).
+- `cpp_engine/CMakeLists.txt` uses CMake `FetchContent` to fetch, at configure time:
+  - **cppzmq** — header-only C++ bindings for ZeroMQ.
+  - **cpp-httplib** (`yhirose/cpp-httplib`) — header-only HTTP/HTTPS client used by `--live` mode to poll Finnhub. Configured with `HTTPLIB_REQUIRE_OPENSSL ON`, which finds OpenSSL, defines `CPPHTTPLIB_OPENSSL_SUPPORT`, and links it so `https://` works.
+  - **nlohmann/json** — header-only JSON parser, used to decode Finnhub responses.
+- **libzmq and OpenSSL are not vendored**: install them via your OS package manager (e.g. `brew install zeromq openssl@3`). OpenSSL is only required for `--live`.
 
 Why this approach:
 
-- cppzmq is small and header-only, so `FetchContent` is straightforward.
-- libzmq is a native dependency that’s better managed by the system (security updates, platform builds).
+- These libraries are small and header-only, so `FetchContent` is straightforward.
+- libzmq and OpenSSL are native dependencies better managed by the system (security updates, platform builds).
 
 ### Linking details
 
@@ -37,6 +40,25 @@ The CMake file links the executable against:
 - libzmq (pulled in transitively by cppzmq’s CMake logic)
 
 If you hit link or discovery issues, the most common cause is that libzmq isn’t installed or isn’t visible to CMake/pkg-config.
+
+### Engine architecture (`cpp_engine/src/`)
+
+The engine is built around a small data-source abstraction so the headline feed can be swapped without touching the publish pipeline:
+
+- **`IMarketDataSource.hpp`** — abstract interface with one method: `std::optional<std::string> nextHeadline()`. Returning `std::nullopt` means "no headline available right now."
+- **`SimulatedDataSource.hpp`** — implements the interface with a built-in vector of mock headlines, rotated sequentially. It self-paces: it returns a headline at most once every 2 seconds and `std::nullopt` in between (via a `std::chrono::steady_clock` timestamp).
+- **`LiveRestDataSource.hpp`** — implements the interface against the Finnhub REST news API. Its constructor starts a background `std::thread` that polls every 2 seconds (cpp-httplib over HTTPS); an `std::atomic<bool>` controls the thread's lifecycle and the destructor joins it. New headlines (de-duplicated by article `id` via an `std::unordered_set<int>`) are pushed onto a `std::queue<std::string>` guarded by a `std::mutex`. JSON parsing happens outside the lock; only the push is inside it. `nextHeadline()` pops the oldest queued headline, or returns `std::nullopt` when the queue is empty.
+- **`MacroFilter.hpp`** — holds the macro keyword list and exposes `bool matches(std::string_view)` using a case-insensitive substring search (C++20 `std::ranges` algorithms). Substring matching means e.g. `Rates` matches "acceleRATES" and `Fed` matches "FedEx"; the downstream LLM acts as a second filter.
+- **`ZmqPublisher.hpp`** — owns the `zmq::context_t` + `zmq::socket_t` (`PUB`), binds in its constructor, and serializes each headline to the JSON wire frame in `publishHeadline()`.
+- **`DotEnv.hpp`** — minimal `.env` loader (`KEY=VALUE`, `#` comments, optional quotes/`export`). It uses `setenv(..., overwrite=0)` so a real shell variable always wins over the file.
+
+`main.cpp` wires these together: it loads `.env`, parses flags (`--simulate`/`--live` + optional endpoint), constructs the chosen source behind a `std::unique_ptr<IMarketDataSource>`, the `MacroFilter`, and the `ZmqPublisher`, then runs the main loop:
+
+1. Call `source->nextHeadline()`.
+2. If a headline is returned: run it through `MacroFilter`, publish matches, and immediately loop again (draining any queued backlog).
+3. If `std::nullopt`: sleep 50 ms to avoid busy-waiting, then loop.
+
+Pacing therefore lives in the *source* (the simulated source's 2 s cadence, the live source's 2 s poll), not the loop — so live headlines drain as fast as they arrive while idle CPU stays near zero. Startup errors (bad flags, bind failure, missing `FINNHUB_API_KEY` under `--live`) are fatal and exit non-zero; per-iteration errors are logged and the loop continues.
 
 ### Extending the C++ side
 
@@ -158,11 +180,11 @@ The repo streams macro headlines from C++ → Node over **PUB/SUB**, and the mai
 ### Publisher (C++)
 
 - `cpp_engine` binds a `PUB` socket (default `tcp://127.0.0.1:5555`).
-- Bind endpoint override: `argv[1]`.
-- A simulated headline is sampled every 2 seconds.
-- Only headlines matching a **hardcoded** macro keyword filter are published.
+- Bind endpoint override: positional CLI argument (any non-flag arg), e.g. `./cpp_engine --live tcp://127.0.0.1:5556`.
+- Source selected by flag: `--simulate` (default; mock headlines every 2 s) or `--live` (Finnhub REST poll every 2 s; needs `FINNHUB_API_KEY` from `cpp_engine/.env` or the environment).
+- Only headlines matching a **hardcoded** macro keyword filter (`MacroFilter`) are published.
 
-**C++ macro keyword filter** (case-insensitive substring): `FOMC`, `CPI`, `Rates`, `Powell`.
+**C++ macro keyword filter** (case-insensitive substring): `FOMC`, `CPI`, `PCE`, `inflation`, `Fed`, `Powell`, `Rates`, `ECB`, `Treasury`, `yield`, `jobs`, `payroll`, `unemployment`, `GDP`, `recession`, `tariff`, `stimulus`, `central bank`, `bond`.
 
 ### Subscriber (TypeScript, main agent)
 
@@ -181,7 +203,8 @@ If no user has messaged since startup, preferences are empty and headlines are l
 
 ### Debug subscriber (`subscriber.ts`)
 
-- `npm run sub` runs a **standalone** `SUB` CLI that only logs headlines matching the same hardcoded macro keywords as C++.
+- `npm run sub` runs a **standalone** `SUB` CLI that only logs headlines matching its own hardcoded macro keyword list in `subscriber.ts`.
+- Note: this list is maintained separately from the C++ engine's `MacroFilter` and is currently narrower (`FOMC`, `CPI`, `Rates`, `Powell`), so the debug subscriber may show fewer headlines than the engine publishes.
 - Useful for verifying ZMQ without Spectrum, Grok, or iMessage.
 
 **Message framing**

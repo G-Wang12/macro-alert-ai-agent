@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build /Users/gordon/programming/projects/macro-alert-ai-agent/cpp_engine/build)",
+      "Bash(cmake -S /Users/gordon/programming/projects/macro-alert-ai-agent/cpp_engine -B /Users/gordon/programming/projects/macro-alert-ai-agent/cpp_engine/build -DCMAKE_BUILD_TYPE=Release)"
+    ]
+  }
+}

@@ -19,12 +19,15 @@ For implementation details (build/linking choices, intended ZeroMQ protocol), se
 - CMake 3.22+
 - A C++20 compiler (Apple Clang / LLVM / GCC)
 - ZeroMQ core library (`libzmq`)
+- OpenSSL (only for `--live` mode; used by cpp-httplib for HTTPS)
 
 On macOS (Homebrew):
 
 ```bash
-brew install cmake zeromq
+brew install cmake zeromq openssl@3
 ```
+
+`cppzmq`, `cpp-httplib`, and `nlohmann/json` are fetched automatically by CMake `FetchContent`; you only install the native libraries above.
 
 ### Build & run
 
@@ -34,20 +37,44 @@ cmake --build cpp_engine/build
 ./cpp_engine/build/cpp_engine
 ```
 
-By default, `cpp_engine` samples a simulated headline every 2 seconds and publishes it over ZeroMQ `PUB` on `tcp://127.0.0.1:5555` **only if it matches a hardcoded macro keyword filter**.
+`cpp_engine` reads headlines from a data source, keeps only those matching a hardcoded macro keyword filter, and publishes the matches over ZeroMQ `PUB` (default `tcp://127.0.0.1:5555`) as JSON frames.
 
-Current macro keywords (case-insensitive substring match): `FOMC`, `CPI`, `Rates`, `Powell`.
+It supports two data sources, selected by flag:
 
-You can override the bind endpoint:
+- `--simulate` (default): rotates through a built-in list of mock headlines, emitting one every 2 seconds. No API key needed.
+- `--live`: polls the Finnhub REST news API (`/api/v1/news?category=general`) every 2 seconds on a background thread, de-duplicating by article `id`. Requires a Finnhub API key (see below).
 
 ```bash
-./cpp_engine/build/cpp_engine tcp://127.0.0.1:5555
+./cpp_engine/build/cpp_engine            # simulate (default)
+./cpp_engine/build/cpp_engine --simulate
+./cpp_engine/build/cpp_engine --live
 ```
+
+Macro keywords (case-insensitive substring match): `FOMC`, `CPI`, `PCE`, `inflation`, `Fed`, `Powell`, `Rates`, `ECB`, `Treasury`, `yield`, `jobs`, `payroll`, `unemployment`, `GDP`, `recession`, `tariff`, `stimulus`, `central bank`, `bond`.
+
+You can override the bind endpoint with a positional argument (works with either mode):
+
+```bash
+./cpp_engine/build/cpp_engine --live tcp://127.0.0.1:5555
+```
+
+#### Live mode: Finnhub API key
+
+`--live` needs `FINNHUB_API_KEY`. Put it in `cpp_engine/.env` (copy from `cpp_engine/.env.example`):
+
+```bash
+cp cpp_engine/.env.example cpp_engine/.env
+# edit cpp_engine/.env and set FINNHUB_API_KEY=...
+```
+
+The engine loads `cpp_engine/.env` at startup (a real shell env var of the same name takes precedence). `--simulate` ignores the key.
+
+Note: the Finnhub general-news feed is a ~100-item snapshot that changes only when new articles are posted (not every 2 seconds). With de-duplication, a run publishes the current matches once, then stays quiet until genuinely new matching headlines appear; a fresh run re-publishes the current set.
 
 Notes:
 
-- `cpp_engine/CMakeLists.txt` fetches `cppzmq` automatically via CMake `FetchContent`.
-- You still need `libzmq` installed system-wide (e.g. via Homebrew).
+- `cpp_engine/CMakeLists.txt` fetches `cppzmq`, `cpp-httplib`, and `nlohmann/json` automatically via CMake `FetchContent`.
+- You still need `libzmq` installed system-wide (e.g. via Homebrew), plus OpenSSL for `--live` HTTPS.
 
 ## ts_agent (Node.js + TypeScript)
 
