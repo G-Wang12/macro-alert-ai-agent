@@ -3,6 +3,7 @@
 #include "IMarketDataSource.hpp"
 #include "LiveRestDataSource.hpp"
 #include "MacroFilter.hpp"
+#include "PacedDataSource.hpp"
 #include "SharedFilter.hpp"
 #include "SimulatedDataSource.hpp"
 #include "ZmqPublisher.hpp"
@@ -25,11 +26,63 @@ namespace
         Live,
     };
 
+    const std::vector<std::string> kDefaultMacroTerms = {
+        "FOMC", "CPI", "PCE", "inflation",
+        "Fed", "Powell", "Rates", "ECB",
+        "Treasury", "yield", "jobs", "payroll",
+        "unemployment", "GDP", "recession",
+        "tariff", "stimulus", "central bank", "bond",
+    };
+
     struct CliArgs
     {
         SourceMode mode = SourceMode::Simulate;
         std::string endpoint = "tcp://127.0.0.1:5555";
+        bool demo = false;
+        int paceMs = 6000;
+        int backlogHours = 24;
+        int backlogMax = 10;
     };
+
+    bool starts_with(std::string_view s, std::string_view prefix)
+    {
+        return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
+    }
+
+    bool parse_int_suffix(std::string_view arg, std::string_view prefix, int &out)
+    {
+        if (!starts_with(arg, prefix))
+            return false;
+        const std::string_view value = arg.substr(prefix.size());
+        if (value.empty())
+            throw std::runtime_error("missing value for " + std::string(prefix));
+        try
+        {
+            const long v = std::stol(std::string(value));
+            out = static_cast<int>(v);
+            return true;
+        }
+        catch (const std::exception &)
+        {
+            throw std::runtime_error("invalid integer for " + std::string(prefix) +
+                                     ": " + std::string(value));
+        }
+    }
+
+    int env_int_or(const char *name, int fallback)
+    {
+        const char *v = std::getenv(name);
+        if (v == nullptr || *v == '\0')
+            return fallback;
+        try
+        {
+            return static_cast<int>(std::stol(v));
+        }
+        catch (const std::exception &)
+        {
+            return fallback;
+        }
+    }
 
     CliArgs parse_args(int argc, char **argv)
     {
@@ -44,6 +97,14 @@ namespace
                 simulate_flag = true;
             else if (a == "--live")
                 live_flag = true;
+            else if (a == "--demo")
+                args.demo = true;
+            else if (parse_int_suffix(a, "--pace-ms=", args.paceMs))
+                continue;
+            else if (parse_int_suffix(a, "--backlog-hours=", args.backlogHours))
+                continue;
+            else if (parse_int_suffix(a, "--backlog-max=", args.backlogMax))
+                continue;
             else if (!a.empty() && a.front() != '-')
                 args.endpoint = std::string(a);
             else
@@ -52,21 +113,50 @@ namespace
 
         if (simulate_flag && live_flag)
             throw std::runtime_error("--simulate and --live are mutually exclusive");
+        if (args.demo && !live_flag)
+            throw std::runtime_error("--demo requires --live");
+
+        if (args.paceMs < 500)
+            throw std::runtime_error("--pace-ms must be at least 500");
+        if (args.backlogHours < 1)
+            throw std::runtime_error("--backlog-hours must be at least 1");
+        if (args.backlogMax < 0)
+            throw std::runtime_error("--backlog-max must be non-negative");
 
         args.mode = live_flag ? SourceMode::Live : SourceMode::Simulate;
         return args;
     }
 
-    std::unique_ptr<IMarketDataSource> make_source(SourceMode mode)
+    std::unique_ptr<IMarketDataSource> make_source(const CliArgs &args)
     {
-        switch (mode)
+        switch (args.mode)
         {
         case SourceMode::Live:
         {
             const char *key = std::getenv("FINNHUB_API_KEY");
             if (key == nullptr || *key == '\0')
                 throw std::runtime_error("--live requires FINNHUB_API_KEY to be set");
-            return std::make_unique<LiveRestDataSource>(key);
+
+            LiveRestConfig config;
+            if (args.demo)
+            {
+                config.demo = true;
+                config.backlogHours =
+                    env_int_or("DEMO_BACKLOG_HOURS", args.backlogHours);
+                config.backlogMax =
+                    env_int_or("DEMO_BACKLOG_MAX", args.backlogMax);
+                config.demoPreferTerms = kDefaultMacroTerms;
+            }
+
+            auto live = std::make_unique<LiveRestDataSource>(key, config);
+
+            if (args.demo)
+            {
+                const int paceMs = env_int_or("DEMO_PACE_MS", args.paceMs);
+                return std::make_unique<PacedDataSource>(
+                    std::move(live), std::chrono::milliseconds(paceMs));
+            }
+            return live;
         }
         case SourceMode::Simulate:
             break;
@@ -74,9 +164,11 @@ namespace
         return std::make_unique<SimulatedDataSource>();
     }
 
-    std::string_view mode_label(SourceMode mode)
+    std::string mode_label(const CliArgs &args)
     {
-        return mode == SourceMode::Live ? "live" : "simulate";
+        if (args.mode == SourceMode::Simulate)
+            return "simulate";
+        return args.demo ? "live+demo" : "live";
     }
 
     std::string exe_dir(const char *argv0)
@@ -109,17 +201,11 @@ int main(int argc, char **argv)
 
         const CliArgs args = parse_args(argc, argv);
 
-        auto source = make_source(args.mode);
+        auto source = make_source(args);
 
         // Built-in macro baseline. Used standalone, and as the fallback whenever
         // the agent has no user interests to push (see SharedFilter).
-        SharedFilter filter{{
-            "FOMC", "CPI", "PCE", "inflation",
-            "Fed", "Powell", "Rates", "ECB",
-            "Treasury", "yield", "jobs", "payroll",
-            "unemployment", "GDP", "recession",
-            "tariff", "stimulus", "central bank", "bond",
-        }};
+        SharedFilter filter{kDefaultMacroTerms};
 
         // Reverse channel: the agent pushes the union of all users' tracked
         // keywords + watchlist tickers here, narrowing what we forward so a
@@ -137,7 +223,17 @@ int main(int argc, char **argv)
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
         std::cout << "cpp_engine: publishing headlines (PUB) on " << args.endpoint
-                  << " [mode=" << mode_label(args.mode) << "]\n";
+                  << " [mode=" << mode_label(args) << "]\n";
+        if (args.demo)
+        {
+            std::cout << "cpp_engine: demo pacing "
+                      << env_int_or("DEMO_PACE_MS", args.paceMs)
+                      << "ms, backlog "
+                      << env_int_or("DEMO_BACKLOG_HOURS", args.backlogHours)
+                      << "h, max "
+                      << env_int_or("DEMO_BACKLOG_MAX", args.backlogMax)
+                      << " headline(s) on first fetch\n";
+        }
         std::cout << "cpp_engine: press Ctrl+C to stop\n";
 
         while (true)
@@ -160,6 +256,11 @@ int main(int argc, char **argv)
                               << " [source: "
                               << (headline->source.empty() ? "unknown" : headline->source)
                               << "]\n";
+                }
+                else if (args.demo)
+                {
+                    std::cout << "demo: skipped (no keyword match): "
+                              << headline->text << "\n";
                 }
                 // Got a headline: loop again immediately to drain any backlog.
             }

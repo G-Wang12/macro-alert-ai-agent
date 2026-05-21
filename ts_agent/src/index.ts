@@ -1,6 +1,6 @@
 import "dotenv/config";
 
-import { Spectrum, type Space } from "spectrum-ts";
+import { Spectrum, cloud, type Space } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import {
   closeSync,
@@ -977,6 +977,46 @@ async function startFilterPublisher(): Promise<void> {
   }, FILTER_HEARTBEAT_MS);
 }
 
+async function logImessageRoutingHint(
+  projectId: string,
+  projectSecret: string,
+): Promise<void> {
+  try {
+    const tokens = await cloud.issueImessageTokens(projectId, projectSecret);
+    if (tokens.type === "dedicated") {
+      const numbers = tokens.numbers ?? {};
+      const entries = Object.entries(numbers);
+      if (entries.length === 0) {
+        console.log(
+          "ts_agent: iMessage dedicated mode — no line numbers provisioned yet. " +
+            "Finish line setup in the Photon dashboard, then text that number (blue bubble).",
+        );
+      } else {
+        console.log("ts_agent: iMessage dedicated mode — text this agent at:");
+        for (const [instanceId, phone] of entries) {
+          console.log(
+            `  • ${phone ?? "(not provisioned — null)"}  [instance ${instanceId}]`,
+          );
+        }
+      }
+      return;
+    }
+
+    console.log(
+      "ts_agent: iMessage SHARED mode — text the shared Photon number shown in your " +
+        "Photon dashboard (not necessarily a named “Line” in the UI unless that line is " +
+        "linked to this project).\n" +
+        "  Your sending phone must be linked to THIS project in the dashboard, or inbound " +
+        "texts never reach the agent (no [iMessage] logs). Run: npm run info",
+    );
+  } catch (err) {
+    console.warn(
+      "ts_agent: could not fetch iMessage routing info (check PROJECT_ID / PROJECT_SECRET):",
+      err,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   acquireSingleInstanceLock();
 
@@ -1004,6 +1044,7 @@ async function main(): Promise<void> {
   });
 
   console.log("ts_agent: Spectrum app started; waiting for messages...");
+  await logImessageRoutingHint(projectId, projectSecret);
 
   void startFilterPublisher().catch((err) => {
     console.error("ts_agent: filter publisher failed to start:", err);

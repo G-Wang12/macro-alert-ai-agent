@@ -43,11 +43,14 @@ It supports two data sources, selected by flag:
 
 - `--simulate` (default): rotates through a built-in list of mock headlines, emitting one every 2 seconds. No API key needed.
 - `--live`: polls the Finnhub REST news API (`/api/v1/news?category=general`) every 2 seconds on a background thread, de-duplicating by article `id`. Requires a Finnhub API key (see below).
+- `--live --demo`: **demo-friendly live mode** — on the first fetch, queues only recent headlines (newest first, capped) instead of the full snapshot; emits at a steady pace (default one every 6s). After the backlog, only genuinely new articles are added (still paced). Use this when demoing with real Finnhub data.
 
 ```bash
 ./cpp_engine/build/cpp_engine            # simulate (default)
 ./cpp_engine/build/cpp_engine --simulate
 ./cpp_engine/build/cpp_engine --live
+./cpp_engine/build/cpp_engine --live --demo
+./cpp_engine/build/cpp_engine --live --demo --pace-ms=8000 --backlog-hours=6 --backlog-max=12
 ```
 
 Macro keywords (case-insensitive substring match): `FOMC`, `CPI`, `PCE`, `inflation`, `Fed`, `Powell`, `Rates`, `ECB`, `Treasury`, `yield`, `jobs`, `payroll`, `unemployment`, `GDP`, `recession`, `tariff`, `stimulus`, `central bank`, `bond`.
@@ -69,7 +72,15 @@ cp cpp_engine/.env.example cpp_engine/.env
 
 The engine loads `cpp_engine/.env` at startup (a real shell env var of the same name takes precedence). `--simulate` ignores the key.
 
-Note: the Finnhub general-news feed is a ~100-item snapshot that changes only when new articles are posted (not every 2 seconds). With de-duplication, a run publishes the current matches once, then stays quiet until genuinely new matching headlines appear; a fresh run re-publishes the current set.
+Note: the Finnhub general-news feed is a ~100-item snapshot that changes only when new articles are posted (not every 2 seconds). With de-duplication, a plain `--live` run publishes the current matches once, then stays quiet until genuinely new matching headlines appear; a fresh run re-publishes the current set. **`--live --demo`** avoids that startup burst by seeding a small recent backlog and pacing emissions (see flags below).
+
+Demo tuning (optional env overrides: `DEMO_PACE_MS`, `DEMO_BACKLOG_HOURS`, `DEMO_BACKLOG_MAX`):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--pace-ms=` | `6000` | Minimum milliseconds between published headlines |
+| `--backlog-hours=` | `24` | On first fetch, prefer macro-matching items from the snapshot (see demo backlog note above) |
+| `--backlog-max=` | `10` | Cap how many backlog headlines are queued on first fetch |
 
 Notes:
 
