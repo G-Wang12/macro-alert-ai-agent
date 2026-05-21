@@ -45,13 +45,13 @@ If you hit link or discovery issues, the most common cause is that libzmq isn’
 
 The engine is built around a small data-source abstraction so the headline feed can be swapped without touching the publish pipeline:
 
-- **`IMarketDataSource.hpp`** — abstract interface with one method: `std::optional<std::string> nextHeadline()`. Returning `std::nullopt` means "no headline available right now."
-- **`SimulatedDataSource.hpp`** — implements the interface with a built-in vector of mock headlines, rotated sequentially. It self-paces: it returns a headline at most once every 2 seconds and `std::nullopt` in between (via a `std::chrono::steady_clock` timestamp).
-- **`LiveRestDataSource.hpp`** — implements the interface against the Finnhub REST news API. Its constructor starts a background `std::thread` that polls every 2 seconds (cpp-httplib over HTTPS); an `std::atomic<bool>` controls the thread's lifecycle and the destructor joins it. New headlines (de-duplicated by article `id` via an `std::unordered_set<int>`) are pushed onto a `std::queue<std::string>` guarded by a `std::mutex`. JSON parsing happens outside the lock; only the push is inside it. `nextHeadline()` pops the oldest queued headline, or returns `std::nullopt` when the queue is empty.
+- **`IMarketDataSource.hpp`** — abstract interface with one method: `std::optional<Headline> nextHeadline()`, where `Headline { std::string text; std::string source; }` pairs the headline with its publisher. Returning `std::nullopt` means "no headline available right now."
+- **`SimulatedDataSource.hpp`** — implements the interface with a built-in vector of mock `Headline`s (each paired with a synthetic publisher spanning trust tiers, e.g. Reuters / Bloomberg / PRNewswire / a no-name blog, so source-trust scoring is exercisable without a live key), rotated sequentially. It self-paces: it returns a headline at most once every 2 seconds and `std::nullopt` in between (via a `std::chrono::steady_clock` timestamp).
+- **`LiveRestDataSource.hpp`** — implements the interface against the Finnhub REST news API. Its constructor starts a background `std::thread` that polls every 2 seconds (cpp-httplib over HTTPS); an `std::atomic<bool>` controls the thread's lifecycle and the destructor joins it. New headlines (de-duplicated by article `id` via an `std::unordered_set<int>`) are pushed — together with the article's `source` field — onto a `std::queue<Headline>` guarded by a `std::mutex`. JSON parsing happens outside the lock; only the push is inside it. `nextHeadline()` pops the oldest queued headline, or returns `std::nullopt` when the queue is empty.
 - **`MacroFilter.hpp`** — holds a keyword list and exposes `bool matches(std::string_view)` using a case-insensitive substring search (C++20 `std::ranges` algorithms). Substring matching means e.g. `Rates` matches "acceleRATES" and `Fed` matches "FedEx"; the downstream LLM acts as a second filter.
 - **`SharedFilter.hpp`** — a thread-safe holder for the *active* `MacroFilter`. The main loop reads it once per headline; the background `FilterSubscriber` swaps in a new one when the agent pushes an updated term set. Built-in macro keywords are the constructor default and the fallback used whenever the pushed set is empty. Reads/writes are guarded by a `std::mutex` around a `std::shared_ptr<const MacroFilter>` (the lock is held only to copy/swap the pointer, not during matching).
 - **`FilterSubscriber.hpp`** — owns a background `std::thread` running a `SUB` socket on `FILTER_ENDPOINT` (default `tcp://127.0.0.1:5556`). It parses `{"type":"filterset","terms":[...]}` frames from the agent and calls `SharedFilter::update()`, skipping no-op updates (the agent heartbeats the same set). `recv` uses a 200 ms `RCVTIMEO` so the thread can observe its stop flag.
-- **`ZmqPublisher.hpp`** — owns the `zmq::context_t` + `zmq::socket_t` (`PUB`), binds in its constructor, and serializes each headline to the JSON wire frame in `publishHeadline()`.
+- **`ZmqPublisher.hpp`** — owns the `zmq::context_t` + `zmq::socket_t` (`PUB`), binds in its constructor, and serializes each headline (text + `source`, both JSON-escaped) to the JSON wire frame in `publishHeadline()`.
 - **`DotEnv.hpp`** — minimal `.env` loader (`KEY=VALUE`, `#` comments, optional quotes/`export`). It uses `setenv(..., overwrite=0)` so a real shell variable always wins over the file.
 
 `main.cpp` wires these together: it loads `.env`, parses flags (`--simulate`/`--live` + optional endpoint), constructs the chosen source behind a `std::unique_ptr<IMarketDataSource>`, the `SharedFilter` (seeded with the macro defaults), the `FilterSubscriber`, and the `ZmqPublisher`, then runs the main loop:
@@ -136,7 +136,7 @@ When a user sends a text message, `ts_agent` extracts macro trading preferences 
 
 - `userPreferences: Map<string, UserPreferences>`
 - Key: `space.id` (conversation id)
-- Value: `{ trackedKeywords: string[], sentimentThreshold: number }`
+- Value: `{ trackedKeywords: string[], watchlist: string[], sentimentThreshold: number, sourceTrustThreshold: number }`
 - `spacesById: Map<string, Space>` — caches the Spectrum `space` handle for proactive outbound sends (populated on each inbound message)
 - `lastAlertBySpace: Map<string, AlertContext>` — headline + Grok analysis for conversational follow-ups (~30 minute TTL)
 
@@ -209,10 +209,10 @@ User preferences (tracked keywords + watchlist tickers) live only in the agent, 
 
 **Headline pipeline**
 
-1. Parse JSON frame; dedupe by `ts` + headline (or headline alone) for ~2 minutes.
-2. Call Grok (`analyzeHeadlineWithLlm`) → `{ sentiment, severity, summary }`.
+1. Parse JSON frame (including the `source` publisher); dedupe by `ts` + headline (or headline alone) for ~2 minutes.
+2. Call Grok (`analyzeHeadlineWithLlm`, passing the headline + source) → `{ sentiment, severity, summary, sourceTrust }`. `sourceTrust` (0–1) is Grok's credibility rating of the publisher; an absent/garbled rating defaults to ~0.3 (low).
 3. For each `userPreferences` entry, enqueue `spaceOutbound.run(spaceId, "alert", …)` (waits if that space has an active alert hold).
-4. Inside the alert task, re-check keywords and `severity >= sentimentThreshold` against current preferences, then `app.send(space, alertText)` and store `lastAlertBySpace`.
+4. Inside the alert task, re-check keywords, `severity >= sentimentThreshold`, **and** `sourceTrust >= sourceTrustThreshold` against current preferences, then `app.send(space, alertText)` and store `lastAlertBySpace`. The alert text and stored context include the source name and its `low`/`medium`/`high` trust label.
 
 If no user has messaged since startup, preferences are empty and headlines are logged but not alerted. If preferences exist but `spacesById` lacks that `space.id`, the agent logs that the user must message first (Spectrum needs a cached conversation handle for outbound iMessage).
 
@@ -229,6 +229,7 @@ If no user has messaged since startup, preferences are empty and headlines are l
   - `type`: `"headline"`
   - `ts`: UTC ISO8601 timestamp
   - `headline`: headline text
+  - `source`: publisher of the headline (e.g. `"Reuters"`); empty string when the upstream feed omits it (the agent treats unknown sources as low trust)
 
 ### Recommended starting point
 

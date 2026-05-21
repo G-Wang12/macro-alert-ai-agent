@@ -17,13 +17,14 @@ it into one of three buckets:
 ## 1. Setting alert preferences
 
 Anything that isn't a follow-up to a recent alert is parsed as a preference
-update. The agent extracts three things from your message:
+update. The agent extracts four things from your message:
 
 | Field | What it is | Example phrasing |
 | --- | --- | --- |
 | `trackedKeywords` | Macro/news triggers to match headlines against | "alert me on CPI, FOMC, and Powell" |
 | `watchlist` | Explicit **stock tickers** you care about | "watch TSLA and NVDA for me" |
 | `sentimentThreshold` | Sensitivity, 0–1 (lower = more alerts) | "only the big stuff, threshold 0.8" |
+| `sourceTrustThreshold` | Minimum publisher trustworthiness, 0–1 (higher = stricter) | "only alert me from reputable sources" |
 
 You can combine them in one message, or send them across several — you don't
 have to restate everything each time. Examples:
@@ -40,6 +41,7 @@ Got it — saved your macro preferences for this chat.
 Tracked keywords: CPI, FOMC
 Watchlist: TSLA, NVDA
 Sentiment threshold: 0.5
+Source trust: any source
 ```
 
 **Updates are incremental.** Each message changes only what it mentions; the
@@ -65,8 +67,9 @@ start over:
 | **Remove** | `stop watching GOOGL`, `untrack CPI`, `no longer alert on rates` | drops just those items |
 | **Replace a list** | `only watch TSLA`, `just track CPI and FOMC` | sets that one list to exactly what you named |
 | **Clear one list** | `clear my watchlist` | empties that list, keeps the rest |
-| **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6) |
+| **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6, any source) |
 | **Set threshold** | `threshold 0.5`, `only big alerts` | changes only the sensitivity |
+| **Filter by source** | `only reputable sources`, `any source is fine` | sets/clears the minimum source-trust level |
 
 Add/remove are case-insensitive, so `untrack cpi` removes `CPI`. Replacing or
 clearing one list (e.g. the watchlist) leaves your keywords and threshold
@@ -84,11 +87,42 @@ it actually forwards headlines mentioning them — see
 [README → Dynamic filter sync](README.md#dynamic-filter-sync). There can be a
 few seconds' lag between saving a watchlist and the engine picking it up.
 
+### Filtering by source trustworthiness
+
+Every alert shows **how trustworthy the publisher is**. When a headline is
+analyzed, the agent has Grok rate the source's credibility from 0 to 1 (based on
+the publisher's reputation — established wire services and major outlets score
+high; press-release wires, aggregators, and unknown/blog sources score low), and
+each alert is labelled `low` / `medium` / `high`:
+
+```
+Macro alert
+Fed raises rates by 25bps, signals higher-for-longer stance
+Source: Reuters · trust high (0.95)
+Severity: 0.90 | Sentiment: bearish (0.20)
+...
+```
+
+By default nothing is filtered on trust — you see alerts from any source. If you
+only want credible publishers, set a minimum:
+
+| Say something like | Effect |
+| --- | --- |
+| `only alert me from reputable sources` | min trust ≈ 0.7 (high) |
+| `trusted sources only` | min trust ≈ 0.6 |
+| `skip blogs and PR wires` | min trust ≈ 0.5 |
+| `any source is fine` | turns the filter off (back to 0) |
+
+The trust threshold is per chat and incremental like your other settings, and it
+stacks with your keyword/watchlist match and sentiment threshold — a headline
+must clear **all** of them to alert.
+
 ### Defaults
 
 A brand-new chat starts at `trackedKeywords = []`, `watchlist = []`,
-`sentimentThreshold = 0.6`. An empty keyword **and** watchlist set means "match
-every headline" (subject to the threshold).
+`sentimentThreshold = 0.6`, `sourceTrustThreshold = 0` (any source). An empty
+keyword **and** watchlist set means "match every headline" (subject to the
+thresholds).
 
 If a message can't be understood (or the LLM call fails), your saved settings
 are left **unchanged** — a bad parse can no longer wipe what you had.
@@ -125,5 +159,6 @@ than answered.
 | Clear a list / reset all | `clear my watchlist`, `reset my settings` |
 | Get fewer / only big alerts | `threshold 0.8` |
 | Get more alerts | `threshold 0.3` |
+| Only trust reputable sources | `only alert me from reputable sources` |
 | Ask about the last alert | `why is this hawkish?` |
 | See what's saved | send any preference message; the reply echoes it back |

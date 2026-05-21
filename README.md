@@ -37,7 +37,7 @@ cmake --build cpp_engine/build
 ./cpp_engine/build/cpp_engine
 ```
 
-`cpp_engine` reads headlines from a data source, keeps only those matching its macro keyword filter, and publishes the matches over ZeroMQ `PUB` (default `tcp://127.0.0.1:5555`) as JSON frames. The filter starts from a built-in macro keyword list but is **overridden at runtime** by the agent, which pushes the union of all users' tracked keywords + watchlist tickers (see [Dynamic filter sync](#dynamic-filter-sync)); with no agent connected it keeps the built-in list.
+`cpp_engine` reads headlines from a data source, keeps only those matching its macro keyword filter, and publishes the matches over ZeroMQ `PUB` (default `tcp://127.0.0.1:5555`) as JSON frames (each carries the headline text plus its `source` publisher, which the agent uses for trust scoring). The filter starts from a built-in macro keyword list but is **overridden at runtime** by the agent, which pushes the union of all users' tracked keywords + watchlist tickers (see [Dynamic filter sync](#dynamic-filter-sync)); with no agent connected it keeps the built-in list.
 
 It supports two data sources, selected by flag:
 
@@ -186,9 +186,9 @@ Troubleshooting (preferences):
 
 After saving preferences (above), leave `npm start` running with `cpp_engine` publishing:
 
-1. Watch the agent console for `[ZMQ] headline: ...` when a headline is received.
-2. If the headline matches your keywords **or watchlist tickers** and Grok’s **severity** is at or above your **sentiment threshold**, you should get a proactive iMessage (no new inbound message required).
-3. Lower threshold → more alerts; higher threshold → fewer.
+1. Watch the agent console for `[ZMQ] headline: ... [source: ...]` when a headline is received.
+2. If the headline matches your keywords **or watchlist tickers**, Grok’s **severity** is at or above your **sentiment threshold**, and the **source trust** Grok assigns the publisher is at or above your **source-trust threshold** (default 0 = any source), you should get a proactive iMessage (no new inbound message required). The alert names the source and its trust level, e.g. `Source: Reuters · trust high (0.95)`.
+3. Lower threshold → more alerts; higher threshold → fewer. Raise the source-trust threshold (e.g. "only reputable sources") to suppress low-credibility publishers — see [`MESSAGING.md`](MESSAGING.md).
 
 #### Testing the watchlist specifically
 
@@ -215,7 +215,7 @@ npm run pub -- "TSLA tumbles 8% on weak deliveries"
 Troubleshooting (alerts):
 
 - No `[ZMQ]` logs: check `cpp_engine` is running and `ZMQ_ENDPOINT` matches its bind address.
-- Headlines logged but no alert: preferences may not match (keywords or severity below threshold), or `XAI_API_KEY` is missing (analysis is skipped).
+- Headlines logged but no alert: preferences may not match (keywords, severity below threshold, or the source's trust below your source-trust threshold), or `XAI_API_KEY` is missing (analysis is skipped).
 - Console says `no user preferences yet`: send at least one iMessage to configure preferences first.
 - Console says `no cached conversation`: you must message the agent at least once per run so it can resolve the Spectrum `space` for outbound sends.
 
