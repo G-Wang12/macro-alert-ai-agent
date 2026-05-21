@@ -25,14 +25,15 @@ update. The agent extracts three things from your message:
 | `watchlist` | Explicit **stock tickers** you care about | "watch TSLA and NVDA for me" |
 | `sentimentThreshold` | Sensitivity, 0–1 (lower = more alerts) | "only the big stuff, threshold 0.8" |
 
-You can combine them in one message. Examples:
+You can combine them in one message, or send them across several — you don't
+have to restate everything each time. Examples:
 
 - `Alert me on CPI and FOMC, threshold 0.5`
 - `Watch TSLA, NVDA, and AAPL for me`
 - `Track inflation and rate decisions, and watch MSFT and GOOGL`
 - `Only ping me on high-impact news — threshold 0.8`
 
-The agent replies with a confirmation echoing what it saved, e.g.:
+The agent replies with a confirmation echoing your **current** settings, e.g.:
 
 ```
 Got it — saved your macro preferences for this chat.
@@ -41,8 +42,35 @@ Watchlist: TSLA, NVDA
 Sentiment threshold: 0.5
 ```
 
-Sending a new preference message **replaces** the saved preferences for that
-chat (it is not additive). Preferences are stored per chat/conversation.
+**Updates are incremental.** Each message changes only what it mentions; the
+rest of your settings are kept. So this works as a conversation:
+
+```
+You:   watch GOOGL and AMZN, threshold 0.3
+Agent: ... Watchlist: GOOGL, AMZN | threshold 0.3
+You:   track CPI
+Agent: ... Tracked keywords: CPI | Watchlist: GOOGL, AMZN | threshold 0.3   ← watchlist + threshold kept
+```
+
+Preferences are stored per chat/conversation.
+
+### Adding, removing, replacing, and resetting
+
+You can adjust settings in plain English — add, remove, replace a whole list, or
+start over:
+
+| Intent | Say something like | Effect |
+| --- | --- | --- |
+| **Add** (default) | `watch TSLA`, `also track FOMC` | appends; existing settings kept |
+| **Remove** | `stop watching GOOGL`, `untrack CPI`, `no longer alert on rates` | drops just those items |
+| **Replace a list** | `only watch TSLA`, `just track CPI and FOMC` | sets that one list to exactly what you named |
+| **Clear one list** | `clear my watchlist` | empties that list, keeps the rest |
+| **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6) |
+| **Set threshold** | `threshold 0.5`, `only big alerts` | changes only the sensitivity |
+
+Add/remove are case-insensitive, so `untrack cpi` removes `CPI`. Replacing or
+clearing one list (e.g. the watchlist) leaves your keywords and threshold
+untouched.
 
 ### What triggers a watchlist alert
 
@@ -58,10 +86,12 @@ few seconds' lag between saving a watchlist and the engine picking it up.
 
 ### Defaults
 
-If you provide nothing matchable (or the LLM call fails), the chat falls back to
-`trackedKeywords = []`, `watchlist = []`, `sentimentThreshold = 0.6`. An empty
-keyword **and** watchlist set means "match every headline" (subject to the
-threshold).
+A brand-new chat starts at `trackedKeywords = []`, `watchlist = []`,
+`sentimentThreshold = 0.6`. An empty keyword **and** watchlist set means "match
+every headline" (subject to the threshold).
+
+If a message can't be understood (or the LLM call fails), your saved settings
+are left **unchanged** — a bad parse can no longer wipe what you had.
 
 ---
 
@@ -90,6 +120,9 @@ than answered.
 | --- | --- |
 | Track macro topics | `alert me on CPI and FOMC` |
 | Watch specific stocks | `watch TSLA and NVDA` |
+| Stop tracking / watching something | `untrack CPI`, `stop watching GOOGL` |
+| Replace a whole list | `only watch TSLA` |
+| Clear a list / reset all | `clear my watchlist`, `reset my settings` |
 | Get fewer / only big alerts | `threshold 0.8` |
 | Get more alerts | `threshold 0.3` |
 | Ask about the last alert | `why is this hawkish?` |

@@ -20,6 +20,31 @@ type UserPreferences = {
   watchlist?: string[]; // explicit stock tickers the user mentioned
 };
 
+// A single inbound message is treated as an incremental change to existing
+// preferences, not a full replacement. The LLM extracts only what THIS message
+// mentions; the merge (mergePreferences) applies it in code.
+//
+// Per list: `replace*` (non-null) sets the list to exactly that value — an empty
+// array clears just that list — and takes precedence over add/remove. Otherwise
+// `add*` then `remove*` are applied. `sentimentThreshold: null` means untouched.
+// `clearAll` resets everything to defaults.
+type PreferenceUpdate = {
+  addKeywords: string[];
+  removeKeywords: string[];
+  replaceKeywords: string[] | null;
+  addTickers: string[];
+  removeTickers: string[];
+  replaceTickers: string[] | null;
+  sentimentThreshold: number | null;
+  clearAll: boolean;
+};
+
+const DEFAULT_PREFERENCES: UserPreferences = {
+  trackedKeywords: [],
+  sentimentThreshold: 0.6,
+  watchlist: [],
+};
+
 type HeadlineMessage = {
   type?: string;
   ts?: string;
@@ -176,33 +201,130 @@ function stripJsonCodeFences(text: string): string {
   return trimmed;
 }
 
-function normalizePreferences(maybe: unknown): UserPreferences | null {
-  if (!maybe || typeof maybe !== "object") return null;
-  const obj = maybe as Record<string, unknown>;
-
-  const tracked = obj.trackedKeywords;
-  const threshold = obj.sentimentThreshold;
-  const watch = obj.watchlist;
-
-  const trackedKeywords = Array.isArray(tracked)
-    ? tracked
+function toStringList(maybe: unknown): string[] {
+  return Array.isArray(maybe)
+    ? maybe
         .filter((x): x is string => typeof x === "string")
         .map((s) => s.trim())
         .filter(Boolean)
     : [];
+}
 
-  const watchlist = Array.isArray(watch)
-    ? watch
-        .filter((x): x is string => typeof x === "string")
-        .map((s) => s.trim().toUpperCase())
-        .filter(Boolean)
-    : [];
+const NOOP_PREFERENCE_UPDATE: PreferenceUpdate = {
+  addKeywords: [],
+  removeKeywords: [],
+  replaceKeywords: null,
+  addTickers: [],
+  removeTickers: [],
+  replaceTickers: null,
+  sentimentThreshold: null,
+  clearAll: false,
+};
 
-  let sentimentThreshold = typeof threshold === "number" ? threshold : 0.6;
-  if (!Number.isFinite(sentimentThreshold)) sentimentThreshold = 0.6;
-  sentimentThreshold = Math.max(0, Math.min(1, sentimentThreshold));
+// Parse the LLM's incremental-update JSON. Returns a no-op update for anything
+// malformed — never throws away existing prefs. A `replace*` field is honored
+// only when it's actually an array (so an empty array means "clear that list",
+// while a missing/null field means "don't replace").
+function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
+  if (!maybe || typeof maybe !== "object") return { ...NOOP_PREFERENCE_UPDATE };
+  const obj = maybe as Record<string, unknown>;
 
-  return { trackedKeywords, sentimentThreshold, watchlist };
+  const upper = (xs: string[]) => xs.map((s) => s.toUpperCase());
+  const asListOrNull = (v: unknown): string[] | null =>
+    Array.isArray(v) ? toStringList(v) : null;
+
+  const replaceTickersRaw = asListOrNull(obj.replaceTickers);
+
+  let sentimentThreshold: number | null = null;
+  if (
+    typeof obj.sentimentThreshold === "number" &&
+    Number.isFinite(obj.sentimentThreshold)
+  ) {
+    sentimentThreshold = Math.max(0, Math.min(1, obj.sentimentThreshold));
+  }
+
+  return {
+    addKeywords: toStringList(obj.addKeywords),
+    removeKeywords: toStringList(obj.removeKeywords),
+    replaceKeywords: asListOrNull(obj.replaceKeywords),
+    addTickers: upper(toStringList(obj.addTickers)),
+    removeTickers: upper(toStringList(obj.removeTickers)),
+    replaceTickers: replaceTickersRaw === null ? null : upper(replaceTickersRaw),
+    sentimentThreshold,
+    clearAll: obj.clearAll === true,
+  };
+}
+
+// Append `additions` to `existing`, dropping case-insensitive duplicates and
+// preserving the existing entries' order and casing.
+function mergeUnique(
+  existing: string[],
+  additions: string[],
+  upper: boolean,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [...existing, ...additions]) {
+    const value = upper ? raw.trim().toUpperCase() : raw.trim();
+    if (!value) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+// Drop any entries of `list` that match `toRemove` case-insensitively.
+function removeItems(list: string[], toRemove: string[]): string[] {
+  if (toRemove.length === 0) return list;
+  const drop = new Set(toRemove.map((s) => s.trim().toLowerCase()));
+  return list.filter((item) => !drop.has(item.toLowerCase()));
+}
+
+// Resolve one list against its update ops: `replace` (if non-null) wins, else
+// add-then-remove. Replacement values are deduped the same way as merges.
+function resolveList(
+  existing: string[],
+  add: string[],
+  remove: string[],
+  replace: string[] | null,
+  upper: boolean,
+): string[] {
+  if (replace !== null) return mergeUnique([], replace, upper);
+  return removeItems(mergeUnique(existing, add, upper), remove);
+}
+
+// Apply an incremental update to the saved preferences. Unmentioned fields are
+// preserved; `clearAll` resets everything to defaults.
+function mergePreferences(
+  current: UserPreferences,
+  update: PreferenceUpdate,
+): UserPreferences {
+  if (update.clearAll) {
+    return {
+      trackedKeywords: [],
+      watchlist: [],
+      sentimentThreshold: DEFAULT_PREFERENCES.sentimentThreshold,
+    };
+  }
+  return {
+    trackedKeywords: resolveList(
+      current.trackedKeywords,
+      update.addKeywords,
+      update.removeKeywords,
+      update.replaceKeywords,
+      false,
+    ),
+    watchlist: resolveList(
+      current.watchlist ?? [],
+      update.addTickers,
+      update.removeTickers,
+      update.replaceTickers,
+      true,
+    ),
+    sentimentThreshold: update.sentimentThreshold ?? current.sentimentThreshold,
+  };
 }
 
 async function listModelIds(
@@ -460,8 +582,13 @@ function looksLikePreferenceUpdate(text: string): boolean {
     /\bkeyword/,
     /\bpreference/,
     /\binterested in\b/,
-    /\bonly (alert|notify)\b/,
+    /\bonly (alert|notify|watch|track)\b/,
     /\bstop alerting\b/,
+    /\bstop watching\b/,
+    /\buntrack\b/,
+    /\bremove\b/,
+    /\bwatchlist\b/,
+    /\bno longer\b/,
     /\bunsubscribe\b/,
   ];
   return patterns.some((p) => p.test(t));
@@ -552,6 +679,46 @@ async function analyzeHeadlineWithLlm(
   }
 }
 
+const SEND_MAX_ATTEMPTS = 3;
+const SEND_RETRY_BASE_MS = 600;
+
+// Photon's outbound gRPC (SendTextMessage) intermittently returns
+// UNAVAILABLE / "Stream refused by server" (gRPC code 14) — a transient
+// server-side condition that typically succeeds on a quick retry. Detect those
+// and retry with linear backoff; let anything else fail fast.
+function isTransientSendError(err: unknown): boolean {
+  const e = err as {
+    grpcCode?: number;
+    message?: string;
+    cause?: { code?: number };
+  };
+  if (e?.grpcCode === 14 || e?.cause?.code === 14) return true;
+  const msg = (e?.message ?? "").toLowerCase();
+  return msg.includes("stream refused") || msg.includes("unavailable");
+}
+
+async function sendWithRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= SEND_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientSendError(err) || attempt === SEND_MAX_ATTEMPTS) break;
+      const delay = SEND_RETRY_BASE_MS * attempt;
+      console.warn(
+        `ts_agent: ${label} send failed (attempt ${attempt}/${SEND_MAX_ATTEMPTS}, ` +
+          `transient) — retrying in ${delay}ms`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
 async function dispatchHeadlineAlerts(
   app: Awaited<ReturnType<typeof Spectrum>>,
   headline: string,
@@ -572,7 +739,7 @@ async function dispatchHeadlineAlerts(
         const prefs = userPreferences.get(spaceId);
         if (!prefs || !shouldAlertUser(headline, analysis, prefs)) return false;
 
-        await app.send(space, alert);
+        await sendWithRetry("alert", () => app.send(space, alert));
         rememberAlertContext(spaceId, headline, analysis);
         return true;
       });
@@ -633,32 +800,48 @@ async function runZmqHeadlineSubscriber(
   }
 }
 
-async function extractPreferencesWithLlm(
+// Extract an *incremental* update from one message. The result is merged into
+// the user's saved prefs by mergePreferences — we never return a full state, so
+// a message that omits a field can't wipe it. On any failure we return a no-op
+// update (which merges to "no change") rather than defaults.
+async function extractPreferenceUpdate(
   userText: string,
-): Promise<UserPreferences> {
+): Promise<PreferenceUpdate> {
   if (!process.env.XAI_API_KEY) {
     console.warn(
-      "ts_agent: XAI_API_KEY is not set (or is empty) — using default preferences.",
+      "ts_agent: XAI_API_KEY is not set (or is empty) — no preference change.",
     );
-    return { trackedKeywords: [], sentimentThreshold: 0.6, watchlist: [] };
+    return { ...NOOP_PREFERENCE_UPDATE };
   }
 
   const system =
-    "You extract macro trading alert preferences from user messages. " +
-    "Return ONLY valid JSON with keys: trackedKeywords (string[]), sentimentThreshold (number 0..1), watchlist (string[]). " +
-    "trackedKeywords should be macro/news triggers like CPI, FOMC, rates, Powell, NFP, inflation. " +
-    "sentimentThreshold is a sensitivity value: lower = more alerts, higher = fewer alerts. " +
-    "watchlist should contain any explicit stock tickers the user mentions (e.g. AAPL, TSLA, NVDA), uppercased; " +
-    "do not invent tickers — only include ones the user actually names. " +
-    "If user provides none, use trackedKeywords=[], sentimentThreshold=0.6, watchlist=[].";
+    "You read ONE chat message and translate it into an incremental change to the " +
+    "user's macro trading alert settings (tracked macro keywords, a watchlist of stock " +
+    "tickers, and a sensitivity threshold). Report ONLY what THIS message asks for; " +
+    "never restate prior settings.\n" +
+    "Return ONLY valid JSON with these keys:\n" +
+    "  addKeywords (string[]): macro/news triggers to ADD (e.g. CPI, FOMC, rates, Powell, inflation).\n" +
+    "  removeKeywords (string[]): keywords to REMOVE (user says stop/drop/untrack/no longer).\n" +
+    "  replaceKeywords (string[] or null): set keywords to EXACTLY this list (user says 'only track …'); else null.\n" +
+    "  addTickers (string[]): stock tickers to ADD, uppercased (e.g. AAPL, TSLA, NVDA).\n" +
+    "  removeTickers (string[]): tickers to REMOVE (user says stop watching/remove/drop).\n" +
+    "  replaceTickers (string[] or null): set watchlist to EXACTLY this list (user says 'only watch …'); else null.\n" +
+    "  sentimentThreshold (number 0..1 or null): set ONLY if the user specifies sensitivity (lower = more alerts); else null.\n" +
+    "  clearAll (boolean): true ONLY if the user wants to reset/clear ALL settings.\n" +
+    "Rules: do not invent tickers — only ones the user names. Use add/remove for incremental changes; " +
+    "use replace* only for 'only/just/set to' phrasing; an empty replace* array clears just that list. " +
+    "Default everything to empty arrays / null / false when the message doesn't mention it.\n" +
+    'Examples:\n' +
+    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":0.3,"clearAll":false}\n' +
+    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"sentimentThreshold":null,"clearAll":false}\n' +
+    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"clearAll":false}\n' +
+    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"sentimentThreshold":null,"clearAll":false}\n' +
+    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"sentimentThreshold":null,"clearAll":false}\n' +
+    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"clearAll":true}';
 
   let content: string;
   try {
-    content = await grokChatCompletion(
-      system,
-      userText,
-      "LLM extraction",
-    );
+    content = await grokChatCompletion(system, userText, "LLM extraction");
   } catch (err) {
     throw err instanceof Error ? err : new Error(String(err));
   }
@@ -666,25 +849,13 @@ async function extractPreferencesWithLlm(
   const jsonText = stripJsonCodeFences(content);
   try {
     const parsed = JSON.parse(jsonText) as unknown;
-    const normalized = normalizePreferences(parsed);
-    if (!normalized) {
-      console.warn(
-        "ts_agent: LLM JSON did not match expected schema — using default preferences.",
-      );
-    }
-    return (
-      normalized ?? {
-        trackedKeywords: [],
-        sentimentThreshold: 0.6,
-        watchlist: [],
-      }
-    );
+    return normalizePreferenceUpdate(parsed);
   } catch (err) {
     console.warn(
-      "ts_agent: Failed to parse LLM JSON — using default preferences.",
+      "ts_agent: Failed to parse LLM JSON — leaving preferences unchanged.",
       err,
     );
-    return { trackedKeywords: [], sentimentThreshold: 0.6, watchlist: [] };
+    return { ...NOOP_PREFERENCE_UPDATE };
   }
 }
 
@@ -865,11 +1036,17 @@ async function main(): Promise<void> {
 
             console.log(`[iMessage] alert follow-up space=${spaceId}: ${text}`);
             const answer = await answerAlertFollowUp(text, alertCtx);
-            await message.reply(answer);
+            await sendWithRetry("alert follow-up reply", () =>
+              message.reply(answer),
+            );
             return;
           }
 
-          const prefs = await extractPreferencesWithLlm(text);
+          // Treat the message as an incremental update: merge into existing
+          // prefs (or defaults for a new chat) so unmentioned fields are kept.
+          const current = userPreferences.get(spaceId) ?? DEFAULT_PREFERENCES;
+          const update = await extractPreferenceUpdate(text);
+          const prefs = mergePreferences(current, update);
           userPreferences.set(spaceId, prefs);
           // Preferences changed — push the new union to the engine so it starts
           // forwarding headlines for any newly tracked keywords / watchlist.
@@ -881,12 +1058,25 @@ async function main(): Promise<void> {
           const watchlistPretty = prefs.watchlist?.length
             ? prefs.watchlist.join(", ")
             : "(none)";
-          await space.send(
+          const confirmation =
             `Got it — saved your macro preferences for this chat.\n` +
-              `Tracked keywords: ${keywordsPretty}\n` +
-              `Watchlist: ${watchlistPretty}\n` +
-              `Sentiment threshold: ${prefs.sentimentThreshold}`,
-          );
+            `Tracked keywords: ${keywordsPretty}\n` +
+            `Watchlist: ${watchlistPretty}\n` +
+            `Sentiment threshold: ${prefs.sentimentThreshold}`;
+          // The update is already saved above; if the confirmation can't be
+          // delivered (even after retries) just log it — don't fall through to
+          // the catch's "couldn't update" message, which would be inaccurate.
+          try {
+            await sendWithRetry("preference confirmation", () =>
+              space.send(confirmation),
+            );
+          } catch (sendErr) {
+            console.error(
+              `[iMessage] preferences saved for space=${spaceId} but confirmation ` +
+                `delivery failed:`,
+              sendErr,
+            );
+          }
         } catch (err) {
           console.error(err);
           if (isAlertFollowUp) {
