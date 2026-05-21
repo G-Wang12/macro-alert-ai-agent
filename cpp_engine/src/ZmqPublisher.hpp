@@ -20,9 +20,9 @@ public:
     ZmqPublisher(const ZmqPublisher &) = delete;
     ZmqPublisher &operator=(const ZmqPublisher &) = delete;
 
-    void publishHeadline(std::string_view headline)
+    void publishHeadline(std::string_view headline, std::string_view source)
     {
-        const std::string payload = build_headline_json(headline);
+        const std::string payload = build_headline_json(headline, source);
         sock_.send(zmq::buffer(payload), zmq::send_flags::none);
     }
 
@@ -86,15 +86,17 @@ private:
         return out;
     }
 
-    static std::string build_headline_json(std::string_view headline)
+    static std::string build_headline_json(std::string_view headline, std::string_view source)
     {
         const std::string ts = iso8601_utc_now();
         std::string out;
-        out.reserve(headline.size() + ts.size() + 32);
+        out.reserve(headline.size() + source.size() + ts.size() + 48);
         out += "{\"type\":\"headline\",\"ts\":\"";
         out += ts;
         out += "\",\"headline\":\"";
         out += json_escape(headline);
+        out += "\",\"source\":\"";
+        out += json_escape(source);
         out += "\"}";
         return out;
     }

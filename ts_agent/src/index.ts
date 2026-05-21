@@ -18,6 +18,9 @@ type UserPreferences = {
   trackedKeywords: string[];
   sentimentThreshold: number; // 0..1
   watchlist?: string[]; // explicit stock tickers the user mentioned
+  // Minimum source trustworthiness (0..1) required to alert. 0 = no filtering
+  // (alert regardless of source); higher values suppress low-trust publishers.
+  sourceTrustThreshold: number;
 };
 
 // A single inbound message is treated as an incremental change to existing
@@ -36,6 +39,7 @@ type PreferenceUpdate = {
   removeTickers: string[];
   replaceTickers: string[] | null;
   sentimentThreshold: number | null;
+  sourceTrustThreshold: number | null;
   clearAll: boolean;
 };
 
@@ -43,22 +47,26 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   trackedKeywords: [],
   sentimentThreshold: 0.6,
   watchlist: [],
+  sourceTrustThreshold: 0,
 };
 
 type HeadlineMessage = {
   type?: string;
   ts?: string;
   headline?: string;
+  source?: string; // publisher of the headline (e.g. "Reuters"); may be absent
 };
 
 type HeadlineAnalysis = {
   sentiment: number; // 0=bearish, 1=bullish
   severity: number; // 0=low market impact, 1=high
   summary: string;
+  sourceTrust: number; // 0=untrustworthy source, 1=highly credible
 };
 
 type AlertContext = {
   headline: string;
+  source: string;
   analysis: HeadlineAnalysis;
   sentAt: number;
 };
@@ -218,6 +226,7 @@ const NOOP_PREFERENCE_UPDATE: PreferenceUpdate = {
   removeTickers: [],
   replaceTickers: null,
   sentimentThreshold: null,
+  sourceTrustThreshold: null,
   clearAll: false,
 };
 
@@ -243,6 +252,14 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
     sentimentThreshold = Math.max(0, Math.min(1, obj.sentimentThreshold));
   }
 
+  let sourceTrustThreshold: number | null = null;
+  if (
+    typeof obj.sourceTrustThreshold === "number" &&
+    Number.isFinite(obj.sourceTrustThreshold)
+  ) {
+    sourceTrustThreshold = Math.max(0, Math.min(1, obj.sourceTrustThreshold));
+  }
+
   return {
     addKeywords: toStringList(obj.addKeywords),
     removeKeywords: toStringList(obj.removeKeywords),
@@ -251,6 +268,7 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
     removeTickers: upper(toStringList(obj.removeTickers)),
     replaceTickers: replaceTickersRaw === null ? null : upper(replaceTickersRaw),
     sentimentThreshold,
+    sourceTrustThreshold,
     clearAll: obj.clearAll === true,
   };
 }
@@ -306,6 +324,7 @@ function mergePreferences(
       trackedKeywords: [],
       watchlist: [],
       sentimentThreshold: DEFAULT_PREFERENCES.sentimentThreshold,
+      sourceTrustThreshold: DEFAULT_PREFERENCES.sourceTrustThreshold,
     };
   }
   return {
@@ -324,6 +343,8 @@ function mergePreferences(
       true,
     ),
     sentimentThreshold: update.sentimentThreshold ?? current.sentimentThreshold,
+    sourceTrustThreshold:
+      update.sourceTrustThreshold ?? current.sourceTrustThreshold,
   };
 }
 
@@ -478,17 +499,23 @@ function normalizeHeadlineAnalysis(maybe: unknown): HeadlineAnalysis | null {
 
   let sentiment = typeof obj.sentiment === "number" ? obj.sentiment : 0.5;
   let severity = typeof obj.severity === "number" ? obj.severity : 0.5;
+  // Default an unscored source to low-ish trust so an absent/garbled rating
+  // doesn't masquerade as credible when a user has set a trust threshold.
+  let sourceTrust =
+    typeof obj.source_trust === "number" ? obj.source_trust : 0.3;
   if (!Number.isFinite(sentiment)) sentiment = 0.5;
   if (!Number.isFinite(severity)) severity = 0.5;
+  if (!Number.isFinite(sourceTrust)) sourceTrust = 0.3;
   sentiment = Math.max(0, Math.min(1, sentiment));
   severity = Math.max(0, Math.min(1, severity));
+  sourceTrust = Math.max(0, Math.min(1, sourceTrust));
 
   const summary =
     typeof obj.summary === "string" && obj.summary.trim()
       ? obj.summary.trim()
       : "";
 
-  return { sentiment, severity, summary };
+  return { sentiment, severity, summary, sourceTrust };
 }
 
 function matchesUserKeywords(
@@ -511,13 +538,22 @@ function shouldAlertUser(
   // so news about a watched stock triggers an alert even if no keyword matches.
   const matchTerms = [...prefs.trackedKeywords, ...(prefs.watchlist ?? [])];
   if (!matchesUserKeywords(headline, matchTerms)) return false;
-  return analysis.severity >= prefs.sentimentThreshold;
+  if (analysis.severity < prefs.sentimentThreshold) return false;
+  // Suppress headlines from sources the user deems insufficiently trustworthy.
+  // Threshold 0 (the default) lets everything through regardless of source.
+  return analysis.sourceTrust >= prefs.sourceTrustThreshold;
 }
 
 function formatSentimentLabel(sentiment: number): string {
   if (sentiment >= 0.65) return "bullish";
   if (sentiment <= 0.35) return "bearish";
   return "neutral";
+}
+
+function formatTrustLabel(trust: number): string {
+  if (trust >= 0.7) return "high";
+  if (trust >= 0.4) return "medium";
+  return "low";
 }
 
 function getRecentAlertContext(spaceId: string): AlertContext | null {
@@ -533,10 +569,12 @@ function getRecentAlertContext(spaceId: string): AlertContext | null {
 function rememberAlertContext(
   spaceId: string,
   headline: string,
+  source: string,
   analysis: HeadlineAnalysis,
 ): void {
   lastAlertBySpace.set(spaceId, {
     headline,
+    source,
     analysis,
     sentAt: Date.now(),
   });
@@ -590,6 +628,8 @@ function looksLikePreferenceUpdate(text: string): boolean {
     /\bwatchlist\b/,
     /\bno longer\b/,
     /\bunsubscribe\b/,
+    /\breputable\b/,
+    /\btrust(ed|worthy)\b/,
   ];
   return patterns.some((p) => p.test(t));
 }
@@ -605,8 +645,10 @@ function shouldHandleAsAlertFollowUp(
 
 function formatAlertContextForLlm(ctx: AlertContext): string {
   const sentimentLabel = formatSentimentLabel(ctx.analysis.sentiment);
+  const trustLabel = formatTrustLabel(ctx.analysis.sourceTrust);
   const lines = [
     `Headline: ${ctx.headline}`,
+    `Source: ${ctx.source || "unknown"} (trust ${trustLabel}, ${ctx.analysis.sourceTrust.toFixed(2)})`,
     `Severity: ${ctx.analysis.severity.toFixed(2)}`,
     `Sentiment: ${sentimentLabel} (${ctx.analysis.sentiment.toFixed(2)})`,
   ];
@@ -634,12 +676,15 @@ async function answerAlertFollowUp(
 
 function formatAlertMessage(
   headline: string,
+  source: string,
   analysis: HeadlineAnalysis,
 ): string {
   const sentimentLabel = formatSentimentLabel(analysis.sentiment);
+  const trustLabel = formatTrustLabel(analysis.sourceTrust);
   const lines = [
     "Macro alert",
     headline,
+    `Source: ${source || "unknown"} · trust ${trustLabel} (${analysis.sourceTrust.toFixed(2)})`,
     `Severity: ${analysis.severity.toFixed(2)} | Sentiment: ${sentimentLabel} (${analysis.sentiment.toFixed(2)})`,
   ];
   if (analysis.summary) {
@@ -650,6 +695,7 @@ function formatAlertMessage(
 
 async function analyzeHeadlineWithLlm(
   headline: string,
+  source: string,
 ): Promise<HeadlineAnalysis | null> {
   if (!process.env.XAI_API_KEY) {
     console.warn(
@@ -661,15 +707,19 @@ async function analyzeHeadlineWithLlm(
   const system =
     "You analyze macro/news headlines for traders. " +
     "Return ONLY valid JSON with keys: sentiment (number 0..1, 0=bearish, 1=bullish), " +
-    "severity (number 0..1, market-moving importance), summary (short string). " +
+    "severity (number 0..1, market-moving importance), summary (short string), " +
+    "source_trust (number 0..1, how trustworthy the PUBLISHER is). " +
+    "Judge source_trust by the publisher's reputation for accurate financial reporting: " +
+    "established wire services and major outlets (e.g. Reuters, Bloomberg, AP, WSJ, Financial Times) ~0.85-1.0; " +
+    "mainstream financial media (e.g. CNBC, MarketWatch, Yahoo Finance) ~0.6-0.8; " +
+    "press-release wires, aggregators, and opinion/blog sites (e.g. PRNewswire, GlobeNewswire, Seeking Alpha, StockTwits) ~0.2-0.4; " +
+    "an unknown, missing, or unrecognized source ~0.3. " +
     "Be conservative: severity should reflect likely market impact, not drama.";
 
+  const user = `Source: ${source || "unknown"}\nHeadline: ${headline}`;
+
   try {
-    const content = await grokChatCompletion(
-      system,
-      headline,
-      "Headline analysis",
-    );
+    const content = await grokChatCompletion(system, user, "Headline analysis");
     const jsonText = stripJsonCodeFences(content);
     const parsed = JSON.parse(jsonText) as unknown;
     return normalizeHeadlineAnalysis(parsed);
@@ -722,6 +772,7 @@ async function sendWithRetry<T>(
 async function dispatchHeadlineAlerts(
   app: Awaited<ReturnType<typeof Spectrum>>,
   headline: string,
+  source: string,
   analysis: HeadlineAnalysis,
 ): Promise<void> {
   for (const spaceId of userPreferences.keys()) {
@@ -733,14 +784,14 @@ async function dispatchHeadlineAlerts(
       continue;
     }
 
-    const alert = formatAlertMessage(headline, analysis);
+    const alert = formatAlertMessage(headline, source, analysis);
     try {
       const sent = await spaceOutbound.run(spaceId, "alert", async () => {
         const prefs = userPreferences.get(spaceId);
         if (!prefs || !shouldAlertUser(headline, analysis, prefs)) return false;
 
         await sendWithRetry("alert", () => app.send(space, alert));
-        rememberAlertContext(spaceId, headline, analysis);
+        rememberAlertContext(spaceId, headline, source, analysis);
         return true;
       });
       if (sent) {
@@ -776,13 +827,15 @@ async function runZmqHeadlineSubscriber(
     if (parsed.type !== "headline") continue;
     const headline = parsed.headline;
     if (typeof headline !== "string" || !headline.trim()) continue;
+    const source =
+      typeof parsed.source === "string" ? parsed.source.trim() : "";
 
     const dedupeKey = parsed.ts
       ? `ts:${parsed.ts}:${headline}`
       : `headline:${headline}`;
     if (!tryStartProcessingHeadline(dedupeKey)) continue;
 
-    console.log(`[ZMQ] headline: ${headline}`);
+    console.log(`[ZMQ] headline: ${headline} [source: ${source || "unknown"}]`);
 
     try {
       if (userPreferences.size === 0) {
@@ -790,10 +843,10 @@ async function runZmqHeadlineSubscriber(
         continue;
       }
 
-      const analysis = await analyzeHeadlineWithLlm(headline);
+      const analysis = await analyzeHeadlineWithLlm(headline, source);
       if (!analysis) continue;
 
-      await dispatchHeadlineAlerts(app, headline, analysis);
+      await dispatchHeadlineAlerts(app, headline, source, analysis);
     } finally {
       finishProcessingHeadline(dedupeKey);
     }
@@ -817,8 +870,8 @@ async function extractPreferenceUpdate(
   const system =
     "You read ONE chat message and translate it into an incremental change to the " +
     "user's macro trading alert settings (tracked macro keywords, a watchlist of stock " +
-    "tickers, and a sensitivity threshold). Report ONLY what THIS message asks for; " +
-    "never restate prior settings.\n" +
+    "tickers, a sensitivity threshold, and a minimum source-trust threshold). Report ONLY " +
+    "what THIS message asks for; never restate prior settings.\n" +
     "Return ONLY valid JSON with these keys:\n" +
     "  addKeywords (string[]): macro/news triggers to ADD (e.g. CPI, FOMC, rates, Powell, inflation).\n" +
     "  removeKeywords (string[]): keywords to REMOVE (user says stop/drop/untrack/no longer).\n" +
@@ -827,17 +880,22 @@ async function extractPreferenceUpdate(
     "  removeTickers (string[]): tickers to REMOVE (user says stop watching/remove/drop).\n" +
     "  replaceTickers (string[] or null): set watchlist to EXACTLY this list (user says 'only watch …'); else null.\n" +
     "  sentimentThreshold (number 0..1 or null): set ONLY if the user specifies sensitivity (lower = more alerts); else null.\n" +
+    "  sourceTrustThreshold (number 0..1 or null): set ONLY if the user wants to filter by how trustworthy the news SOURCE is " +
+    "(higher = stricter, only more credible publishers). Map phrasing to a number: " +
+    "'only high-trust/reputable sources' -> ~0.7, 'trusted sources only' -> ~0.6, 'skip blogs/tabloids/PR wires' -> ~0.5, " +
+    "'any source is fine' / 'stop filtering sources' -> 0; else null.\n" +
     "  clearAll (boolean): true ONLY if the user wants to reset/clear ALL settings.\n" +
     "Rules: do not invent tickers — only ones the user names. Use add/remove for incremental changes; " +
     "use replace* only for 'only/just/set to' phrasing; an empty replace* array clears just that list. " +
     "Default everything to empty arrays / null / false when the message doesn't mention it.\n" +
     'Examples:\n' +
-    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":0.3,"clearAll":false}\n' +
-    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"sentimentThreshold":null,"clearAll":false}\n' +
-    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"clearAll":false}\n' +
-    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"sentimentThreshold":null,"clearAll":false}\n' +
-    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"sentimentThreshold":null,"clearAll":false}\n' +
-    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"clearAll":true}';
+    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":0.3,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":0.7,"clearAll":false}\n' +
+    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":true}';
 
   let content: string;
   try {
@@ -1058,11 +1116,16 @@ async function main(): Promise<void> {
           const watchlistPretty = prefs.watchlist?.length
             ? prefs.watchlist.join(", ")
             : "(none)";
+          const sourceTrustPretty =
+            prefs.sourceTrustThreshold > 0
+              ? `min ${prefs.sourceTrustThreshold} (${formatTrustLabel(prefs.sourceTrustThreshold)}+)`
+              : "any source";
           const confirmation =
             `Got it — saved your macro preferences for this chat.\n` +
             `Tracked keywords: ${keywordsPretty}\n` +
             `Watchlist: ${watchlistPretty}\n` +
-            `Sentiment threshold: ${prefs.sentimentThreshold}`;
+            `Sentiment threshold: ${prefs.sentimentThreshold}\n` +
+            `Source trust: ${sourceTrustPretty}`;
           // The update is already saved above; if the confirmation can't be
           // delivered (even after retries) just log it — don't fall through to
           // the catch's "couldn't update" message, which would be inaccurate.

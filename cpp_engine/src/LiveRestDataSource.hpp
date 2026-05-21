@@ -40,13 +40,13 @@ public:
     LiveRestDataSource(const LiveRestDataSource &) = delete;
     LiveRestDataSource &operator=(const LiveRestDataSource &) = delete;
 
-    std::optional<std::string> nextHeadline() override
+    std::optional<Headline> nextHeadline() override
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (headlines_.empty())
             return std::nullopt;
 
-        std::string headline = std::move(headlines_.front());
+        Headline headline = std::move(headlines_.front());
         headlines_.pop();
         return headline;
     }
@@ -102,8 +102,15 @@ private:
             if (!seenIds_.insert(id).second)
                 continue;
 
+            // Finnhub returns the publisher in "source"; keep it for trust
+            // scoring downstream. Leave empty when absent (treated as unknown).
+            std::string source;
+            const auto sourceIt = item.find("source");
+            if (sourceIt != item.end() && sourceIt->is_string())
+                source = sourceIt->get<std::string>();
+
             std::lock_guard<std::mutex> lock(mutex_);
-            headlines_.push(headlineIt->get<std::string>());
+            headlines_.push(Headline{headlineIt->get<std::string>(), std::move(source)});
         }
     }
 
@@ -122,7 +129,7 @@ private:
     std::string apiKey_;
     std::atomic<bool> running_;
     std::mutex mutex_;
-    std::queue<std::string> headlines_;
+    std::queue<Headline> headlines_;
     std::unordered_set<int> seenIds_;
     std::thread worker_;
 };

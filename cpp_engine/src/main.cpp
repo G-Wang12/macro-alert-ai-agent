@@ -153,10 +153,13 @@ int main(int argc, char **argv)
                     continue;
                 }
 
-                if (filter.current()->matches(*headline))
+                if (filter.current()->matches(headline->text))
                 {
-                    publisher.publishHeadline(*headline);
-                    std::cout << "published: " << *headline << "\n";
+                    publisher.publishHeadline(headline->text, headline->source);
+                    std::cout << "published: " << headline->text
+                              << " [source: "
+                              << (headline->source.empty() ? "unknown" : headline->source)
+                              << "]\n";
                 }
                 // Got a headline: loop again immediately to drain any backlog.
             }
