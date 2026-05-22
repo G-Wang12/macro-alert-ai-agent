@@ -5,7 +5,7 @@ Dual-language starter repo with:
 - `cpp_engine/`: a C++20 engine built with CMake and linked to ZeroMQ (libzmq + cppzmq)
 - `ts_agent/`: a Node.js + TypeScript agent using `zeromq`, xAI (Grok), and `dotenv`
 
-For implementation details (build/linking choices, intended ZeroMQ protocol), see `TECHNICAL.md`. For what end users should text the agent (preferences, watchlist, follow-ups), see `MESSAGING.md`.
+For implementation details (build/linking choices, intended ZeroMQ protocol), see `TECHNICAL.md`. For what end users should text the agent (preferences, watchlist, follow-ups), see `MESSAGING.md`. For registration, hosting, multi-user vs persistent storage, and landing-page flow, see [`ONBOARDING.md`](ONBOARDING.md).
 
 ## Repository layout
 
