@@ -139,6 +139,7 @@ When a user sends a text message, `ts_agent` extracts macro trading preferences 
 - Value: `{ trackedKeywords: string[], watchlist: string[], severityThreshold: number, sourceTrustThreshold: number, alertsPaused: boolean }`
 - `spacesById: Map<string, Space>` — caches the Spectrum `space` handle for proactive outbound sends (populated on each inbound message)
 - `alertHistoryBySpace: Map<string, AlertContext[]>` — ordered newest-first list of up to 10 recent alert contexts per space, each with a 30-minute TTL. Used for conversational follow-ups. Each `AlertContext` includes the headline, source, Grok analysis, send timestamp, and the `OutboundMessage.id` of the alert we sent (used for best-effort thread-reply matching on platforms that expose it).
+- `unrespondedAlertCountsBySpace: Map<string, number>` — counts consecutive proactive alerts per chat. Any inbound user message resets the count; after 15 proactive alerts without a response, the agent sets `alertsPaused = true` and asks the user to text `continue`.
 
 This is intentionally **ephemeral** (memory-only). Persisting to a DB can be added later once the preference schema stabilizes.
 
@@ -212,7 +213,7 @@ User preferences (tracked keywords + watchlist tickers) live only in the agent, 
 1. Parse JSON frame (including the `source` publisher); dedupe by `ts` + headline (or headline alone) for ~2 minutes.
 2. Call Grok (`analyzeHeadlineWithLlm`, passing the headline + source) → `{ sentiment, severity, summary, sourceTrust }`. `sourceTrust` (0–1) is Grok's credibility rating of the publisher; an absent/garbled rating defaults to ~0.3 (low).
 3. For each `userPreferences` entry, enqueue `spaceOutbound.run(spaceId, "alert", …)` (waits if that space has an active alert hold).
-4. Inside the alert task, re-check that alerts are not paused, keywords match, `severity >= severityThreshold`, **and** `sourceTrust >= sourceTrustThreshold` against current preferences, then `app.send(space, alertText)` and append the result to `alertHistoryBySpace` (along with the `OutboundMessage.id` for best-effort thread-reply matching). The alert text and stored context include the source name and its `low`/`medium`/`high` trust label. (`severityThreshold` is the user-facing “threshold”; it gates on market impact, not bullish/bearish sentiment.)
+4. Inside the alert task, re-check that alerts are not paused, keywords match, `severity >= severityThreshold`, **and** `sourceTrust >= sourceTrustThreshold` against current preferences, then `app.send(space, alertText)` and append the result to `alertHistoryBySpace` (along with the `OutboundMessage.id` for best-effort thread-reply matching). The alert text and stored context include the source name and its `low`/`medium`/`high` trust label. (`severityThreshold` is the user-facing “threshold”; it gates on market impact, not bullish/bearish sentiment.) Each sent proactive alert increments the per-chat unresponded count; the 15th consecutive alert auto-pauses that chat and sends a notice telling the user to text `continue`.
 
 If no user has messaged since startup, preferences are empty and headlines are logged but not alerted. If preferences exist but `spacesById` lacks that `space.id`, the agent logs that the user must message first (Spectrum needs a cached conversation handle for outbound iMessage).
 

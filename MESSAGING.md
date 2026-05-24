@@ -90,15 +90,19 @@ start over:
 | **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6, any source) |
 | **Set impact threshold** | `threshold 0.5`, `only big alerts` | changes how market-moving news must be |
 | **Filter by source** | `only reputable sources`, `any source is fine` | sets/clears the minimum source-trust level |
-| **Pause/resume alerts** | `pause alerts`, `resume alerts` | keeps settings but suppresses/restores proactive alerts |
+| **Pause/resume alerts** | `pause alerts`, `resume alerts`, `continue` | keeps settings but suppresses/restores proactive alerts |
 
 Add/remove are case-insensitive, so `untrack cpi` removes `CPI`. Replacing or
 clearing one list (e.g. the watchlist) leaves your keywords and threshold
 untouched.
 
 Pausing alerts is also incremental: it keeps your keywords, watchlist, severity
-threshold, and source-trust threshold unchanged. Text `resume alerts` to turn
-proactive alerts back on.
+threshold, and source-trust threshold unchanged. Text `resume alerts` or
+`continue` to turn proactive alerts back on.
+
+To avoid runaway alert streams, the agent auto-pauses a chat after 15 proactive
+alerts without a user response. It sends a note explaining the limit; reply
+`continue` to resume alerts.
 
 ### What triggers a watchlist alert
 
@@ -194,6 +198,6 @@ me on CPI") and it'll be saved rather than answered.
 | Get more alerts | `threshold 0.3` |
 | Only trust reputable sources | `only alert me from reputable sources` |
 | Pause proactive alerts | `pause alerts` |
-| Resume proactive alerts | `resume alerts` |
+| Resume proactive alerts | `resume alerts`, `continue` |
 | Ask about a recent alert | `why is this hawkish?`, `what does the Waller news mean?` |
 | See what's saved | send any preference message; the reply echoes it back |

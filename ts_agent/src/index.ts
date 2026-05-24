@@ -95,6 +95,8 @@ const spacesById = new Map<string, Space>();
 // Ordered newest-first; capped at ALERT_HISTORY_MAX entries per space.
 const alertHistoryBySpace = new Map<string, AlertContext[]>();
 const ALERT_HISTORY_MAX = 10;
+const unrespondedAlertCountsBySpace = new Map<string, number>();
+const MAX_UNRESPONDED_ALERTS = 15;
 const spaceOutbound = new SpaceOutboundCoordinator();
 
 // Reverse channel to cpp_engine: we PUB the union of every user's tracked
@@ -245,6 +247,8 @@ function detectPauseUpdate(userText: string): boolean | null {
   if (!t) return null;
 
   const resumePatterns = [
+    /^continue$/,
+    /^continue alerts?$/,
     /\bresume alerts?\b/,
     /\bunpause alerts?\b/,
     /\bunmute alerts?\b/,
@@ -697,6 +701,8 @@ function looksLikePreferenceUpdate(text: string): boolean {
     /\bpause alerts?\b/,
     /\bresume alerts?\b/,
     /\bunpause alerts?\b/,
+    /^continue$/,
+    /^continue alerts?$/,
     /\bmute alerts?\b/,
     /\bunmute alerts?\b/,
     /\bdisable alerts?\b/,
@@ -791,6 +797,14 @@ function formatAlertMessage(
     lines.push(analysis.summary);
   }
   return lines.join("\n");
+}
+
+function formatAutoPauseMessage(): string {
+  return (
+    `Alerts are paused because this chat reached the current limit of ` +
+    `${MAX_UNRESPONDED_ALERTS} alerts without a user response.\n` +
+    `To continue receiving alerts, just type continue.`
+  );
 }
 
 async function analyzeHeadlineWithLlm(
@@ -892,6 +906,27 @@ async function dispatchHeadlineAlerts(
 
         const outMsg = await sendWithRetry("alert", () => app.send(space, alert));
         rememberAlertContext(spaceId, headline, source, analysis, outMsg?.id);
+        const unrespondedCount =
+          (unrespondedAlertCountsBySpace.get(spaceId) ?? 0) + 1;
+        unrespondedAlertCountsBySpace.set(spaceId, unrespondedCount);
+
+        if (unrespondedCount >= MAX_UNRESPONDED_ALERTS) {
+          userPreferences.set(spaceId, { ...prefs, alertsPaused: true });
+          try {
+            await sendWithRetry("alert auto-pause notice", () =>
+              app.send(space, formatAutoPauseMessage()),
+            );
+          } catch (noticeErr) {
+            console.error(
+              `[ZMQ] alerts auto-paused space=${spaceId} but notice failed:`,
+              noticeErr,
+            );
+          }
+          console.log(
+            `[ZMQ] alerts auto-paused space=${spaceId} after ${unrespondedCount} unresponded alert(s)`,
+          );
+        }
+
         return true;
       });
       if (sent) {
@@ -992,7 +1027,7 @@ async function extractPreferenceUpdate(
     "'only high-trust/reputable sources' -> ~0.7, 'trusted sources only' -> ~0.6, 'skip blogs/tabloids/PR wires' -> ~0.5, " +
     "'any source is fine' / 'stop filtering sources' -> 0; else null.\n" +
     "  alertsPaused (boolean or null): true if the user asks to pause/mute/snooze/disable/stop all alerts; " +
-    "false if they ask to resume/unpause/unmute/enable/start alerts; otherwise null.\n" +
+    "false if they ask to continue/resume/unpause/unmute/enable/start alerts; otherwise null.\n" +
     "  clearAll (boolean): true ONLY if the user wants to reset/clear ALL settings.\n" +
     "Rules: do not invent tickers — only ones the user names. Use add/remove for incremental changes; " +
     "use replace* only for 'only/just/set to' phrasing; an empty replace* array clears just that list. " +
@@ -1004,6 +1039,7 @@ async function extractPreferenceUpdate(
     '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
     '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":0.7,"alertsPaused":null,"clearAll":false}\n' +
     '  "pause alerts" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":true,"clearAll":false}\n' +
+    '  "continue" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":false,"clearAll":false}\n' +
     '  "resume alerts" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":false,"clearAll":false}\n' +
     '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
     '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":true}';
@@ -1241,6 +1277,7 @@ async function main(): Promise<void> {
         (messageId ? ` id=${messageId}` : "") +
         `: ${text}`,
     );
+    unrespondedAlertCountsBySpace.set(spaceId, 0);
 
     void spaceOutbound
       .run(spaceId, "user", async () => {
