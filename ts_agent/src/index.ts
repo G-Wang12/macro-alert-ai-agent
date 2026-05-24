@@ -1181,6 +1181,7 @@ async function main(): Promise<void> {
     projectId,
     projectSecret,
     providers: [imessage.config()],
+    telemetry: true,
   });
 
   process.on("SIGINT", () => {
