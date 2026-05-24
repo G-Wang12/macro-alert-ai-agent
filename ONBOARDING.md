@@ -217,6 +217,10 @@ Operational notes:
 - **Public number = public product** — budget Grok/Finnhub for unsolicited texts
   unless you add gating.
 - **One agent process** — do not run duplicate `npm start` (duplicate replies).
+- **Railway/Docker** — use the repo-root `Dockerfile` so one container builds
+  and starts both `cpp_engine` and `ts_agent` via `scripts/start-railway.sh`.
+  Leave Railway's custom start command blank unless intentionally overriding the
+  Docker `CMD`.
 
 ---
 

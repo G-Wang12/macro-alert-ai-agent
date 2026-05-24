@@ -146,6 +146,64 @@ Start `cpp_engine` in another terminal so headlines are published:
 ./cpp_engine/build/cpp_engine
 ```
 
+## Deploying on Railway
+
+The repo includes a root `Dockerfile` for deploying both long-running processes
+in one Railway service:
+
+- `cpp_engine` publishes matching headlines on ZeroMQ.
+- `ts_agent` handles Spectrum/iMessage, Grok analysis, user routing, and the
+  reverse filter-set channel.
+
+Keeping both processes in one container lets them communicate over
+`127.0.0.1`, matching the local development architecture.
+
+### Railway setup
+
+1. Create a Railway service from this GitHub repo.
+2. Leave the service root at the repository root so Railway sees `Dockerfile`.
+3. Do **not** set a custom start command unless you need to override the Docker
+   `CMD`; the image already starts `./scripts/start-railway.sh`.
+4. Add environment variables in Railway:
+
+```bash
+XAI_API_KEY=...
+PROJECT_ID=...
+PROJECT_SECRET=...
+ZMQ_ENDPOINT=tcp://127.0.0.1:5555
+FILTER_ENDPOINT=tcp://127.0.0.1:5556
+```
+
+By default, the startup script runs simulated data:
+
+```bash
+cpp_engine --simulate tcp://127.0.0.1:5555
+```
+
+To use live Finnhub data later, add `FINNHUB_API_KEY` and override the engine
+flags explicitly with `ENGINE_ARGS`, for example:
+
+```bash
+ENGINE_ARGS=--live --demo --pace-ms=8000 tcp://127.0.0.1:5555
+```
+
+Do not commit `.env` files; Railway environment variables replace them in
+deployment.
+
+### Local Docker smoke test
+
+```bash
+docker build -t macro-alert-ai-agent .
+docker run --rm \
+  -e XAI_API_KEY=... \
+  -e PROJECT_ID=... \
+  -e PROJECT_SECRET=... \
+  macro-alert-ai-agent
+```
+
+This uses simulated headlines by default. Spectrum and Grok still require their
+own credentials for the full iMessage flow.
+
 ### Dynamic filter sync
 
 The engine can't know about users on its own, so the **agent tells it what to
