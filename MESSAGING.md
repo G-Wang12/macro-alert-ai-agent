@@ -157,12 +157,20 @@ preferences" reply). Examples:
 - `What does this mean for rates?`
 - `Summarize the whole report`
 - `Break this down for me`
+- `Why is the Waller news good for equities?`
 
-This works for about **30 minutes** after the alert. The agent recognizes
-follow-ups by question phrasing (messages ending in `?`, or starting with
-why/what/how/explain/summarize, etc.). If you instead want to change settings,
-phrase it as a preference (e.g. "alert me on CPI") and it'll be saved rather
-than answered.
+The agent keeps up to **10 recent alerts** per chat, each for **30 minutes**
+after it was sent. The agent recognizes follow-ups by question phrasing (messages
+ending in `?`, or starting with why/what/how/explain/summarize, etc.).
+
+**Multiple alerts in the window:** If several alerts are active, you don't need
+to do anything special. Just ask naturally — the agent passes all recent alerts
+to the AI and it works out which one your question is about from the wording. If
+your question is ambiguous, the AI picks the most relevant alert and briefly says
+which one it chose.
+
+If you instead want to change settings, phrase it as a preference (e.g. "alert
+me on CPI") and it'll be saved rather than answered.
 
 ---
 
@@ -178,5 +186,5 @@ than answered.
 | Get fewer / only big alerts | `threshold 0.8` |
 | Get more alerts | `threshold 0.3` |
 | Only trust reputable sources | `only alert me from reputable sources` |
-| Ask about the last alert | `why is this hawkish?` |
+| Ask about a recent alert | `why is this hawkish?`, `what does the Waller news mean?` |
 | See what's saved | send any preference message; the reply echoes it back |

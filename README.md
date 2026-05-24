@@ -135,7 +135,7 @@ npm start
 `npm start` runs one process that:
 
 1. **Reactive (iMessage)**: listens on Spectrum `app.messages`, extracts preferences with Grok, and replies.
-2. **Follow-ups**: after a proactive alert, answer questions about that headline (e.g. “Why is this hawkish?”) via threaded `message.reply()`.
+2. **Follow-ups**: after one or more proactive alerts, answer questions about any recent alert (up to 10, within 30 minutes each). The agent uses the LLM to infer which alert the question is about from the wording, so users just ask naturally — no thread-reply gymnastics required.
 3. **Proactive (ZeroMQ)**: subscribes to `cpp_engine` headlines in the background, analyzes each with Grok, and pushes iMessage alerts when a user’s preferences match.
 
 Outbound messages to the same chat are ordered so preference confirmations are not interrupted by a concurrent alert (see `TECHNICAL.md`).
@@ -232,17 +232,17 @@ Troubleshooting (alerts):
 
 ### What to test (alert follow-ups)
 
-After you receive a proactive macro alert:
+After you receive one or more proactive macro alerts:
 
-1. Reply in the same chat with a question about that alert, e.g. `Why is this hawkish?` or `Summarize the whole report`.
-2. You should get a threaded analysis reply (not a “Got it — saved preferences” message).
-3. Follow-ups work for ~30 minutes after the alert; send a new preference message (e.g. “alert me on CPI”) if you want to change settings instead.
+1. Reply in the same chat with a question, e.g. `Why is this hawkish?` or `What does the Waller news mean for rate cuts?`
+2. You should get a threaded analysis reply (not a "Got it — saved preferences" message).
+3. If several alerts are active, the agent passes all of them to the AI which picks the most relevant one based on your question — you don't need to do anything special to reference a specific alert.
+4. Each alert stays in context for **30 minutes** after it was sent; up to 10 alerts are tracked per chat. Send a new preference message (e.g. "alert me on CPI") if you want to change settings instead.
 
 Troubleshooting (follow-ups):
 
-- Got a preferences reply instead of analysis: phrase your message as a question, or include words like “why”, “summarize”, or “hawkish”. Messages like “alert me on CPI” are treated as preference updates.
-- “I don't have a recent alert in context”: no alert was stored for this chat yet, or the 30-minute context window expired.
-
+- Got a preferences reply instead of analysis: phrase your message as a question, or include words like "why", "summarize", or "hawkish". Messages like "alert me on CPI" are treated as preference updates.
+- No alerts active yet: wait for an alert to arrive (or inject one with `npm run pub`), then ask your question within the 30-minute window.
 ### Debug-only: standalone ZeroMQ subscriber
 
 `npm run sub` runs `subscriber.ts` alone — it only logs headlines that pass the hardcoded C++ macro keyword filter. Use it to verify ZMQ wiring without Spectrum or Grok:

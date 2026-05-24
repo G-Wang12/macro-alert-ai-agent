@@ -138,20 +138,20 @@ When a user sends a text message, `ts_agent` extracts macro trading preferences 
 - Key: `space.id` (conversation id)
 - Value: `{ trackedKeywords: string[], watchlist: string[], severityThreshold: number, sourceTrustThreshold: number }`
 - `spacesById: Map<string, Space>` — caches the Spectrum `space` handle for proactive outbound sends (populated on each inbound message)
-- `lastAlertBySpace: Map<string, AlertContext>` — headline + Grok analysis for conversational follow-ups (~30 minute TTL)
+- `alertHistoryBySpace: Map<string, AlertContext[]>` — ordered newest-first list of up to 10 recent alert contexts per space, each with a 30-minute TTL. Used for conversational follow-ups. Each `AlertContext` includes the headline, source, Grok analysis, send timestamp, and the `OutboundMessage.id` of the alert we sent (used for best-effort thread-reply matching on platforms that expose it).
 
 This is intentionally **ephemeral** (memory-only). Persisting to a DB can be added later once the preference schema stabilizes.
 
 ### Alert follow-ups
 
-After a proactive alert is sent, the agent stores `AlertContext` for that `space.id`. On later inbound text:
+After a proactive alert is sent, the agent appends `AlertContext` to a per-space history (`alertHistoryBySpace`). On later inbound text:
 
-1. If there is recent alert context and the message looks like a **follow-up question** (e.g. ends with `?`, starts with “why”/“summarize”, mentions hawkish/dovish), it is **not** treated as a preference update.
-2. Grok receives the stored headline/analysis plus the user’s question.
-3. The response is sent with `message.reply()` so it threads in iMessage.
+1. **Follow-up detection**: if the message looks like a question (ends with `?`, starts with why/summarize/explain/what/how, mentions hawkish/dovish, etc.) **and** at least one unexpired alert is in the history, it is routed as a follow-up rather than a preference update.
+2. **Multi-alert resolution**: all unexpired alert contexts (up to 10, each within 30 minutes of being sent) are passed to Grok together. The model identifies which alert the question is most relevant to and answers about it. For an unambiguous question it answers directly; for an ambiguous one it briefly notes which alert it chose.
+3. **Thread-reply matching (best-effort)**: if the platform delivers the message as a Spectrum `content.type === "reply"` pointing to one of our sent alert message IDs, only that specific alert context is passed — no multi-alert resolution needed. Note: the iMessage provider does **not** expose thread-originator GUIDs on plain inbound text messages at the Spectrum level, so long-press → Reply in iMessage arrives as a plain text message and takes the multi-alert resolution path above. The thread-reply path is preserved for platforms that do expose this.
+4. The response is sent with `message.reply()` so it threads in iMessage.
 
-Preference-shaped messages (e.g. “alert me on CPI”, “threshold 0.5”) still go through preference extraction even if alert context exists.
-
+Preference-shaped messages (e.g. "alert me on CPI", "threshold 0.5") still go through preference extraction even if alert history exists.
 ### LLM preference extraction
 
 Preferences are extracted by calling an **OpenAI-compatible** chat completions endpoint.
@@ -212,7 +212,7 @@ User preferences (tracked keywords + watchlist tickers) live only in the agent, 
 1. Parse JSON frame (including the `source` publisher); dedupe by `ts` + headline (or headline alone) for ~2 minutes.
 2. Call Grok (`analyzeHeadlineWithLlm`, passing the headline + source) → `{ sentiment, severity, summary, sourceTrust }`. `sourceTrust` (0–1) is Grok's credibility rating of the publisher; an absent/garbled rating defaults to ~0.3 (low).
 3. For each `userPreferences` entry, enqueue `spaceOutbound.run(spaceId, "alert", …)` (waits if that space has an active alert hold).
-4. Inside the alert task, re-check keywords, `severity >= severityThreshold`, **and** `sourceTrust >= sourceTrustThreshold` against current preferences, then `app.send(space, alertText)` and store `lastAlertBySpace`. The alert text and stored context include the source name and its `low`/`medium`/`high` trust label. (`severityThreshold` is the user-facing “threshold”; it gates on market impact, not bullish/bearish sentiment.)
+4. Inside the alert task, re-check keywords, `severity >= severityThreshold`, **and** `sourceTrust >= sourceTrustThreshold` against current preferences, then `app.send(space, alertText)` and append the result to `alertHistoryBySpace` (along with the `OutboundMessage.id` for best-effort thread-reply matching). The alert text and stored context include the source name and its `low`/`medium`/`high` trust label. (`severityThreshold` is the user-facing “threshold”; it gates on market impact, not bullish/bearish sentiment.)
 
 If no user has messaged since startup, preferences are empty and headlines are logged but not alerted. If preferences exist but `spacesById` lacks that `space.id`, the agent logs that the user must message first (Spectrum needs a cached conversation handle for outbound iMessage).
 

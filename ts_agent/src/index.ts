@@ -71,6 +71,7 @@ type AlertContext = {
   source: string;
   analysis: HeadlineAnalysis;
   sentAt: number;
+  alertMessageId?: string; // id of the OutboundMessage we sent, used to match thread replies
 };
 
 type ChatCompletionResponse = {
@@ -87,7 +88,9 @@ type ModelListResponse = {
 
 const userPreferences = new Map<string, UserPreferences>();
 const spacesById = new Map<string, Space>();
-const lastAlertBySpace = new Map<string, AlertContext>();
+// Ordered newest-first; capped at ALERT_HISTORY_MAX entries per space.
+const alertHistoryBySpace = new Map<string, AlertContext[]>();
+const ALERT_HISTORY_MAX = 10;
 const spaceOutbound = new SpaceOutboundCoordinator();
 
 // Reverse channel to cpp_engine: we PUB the union of every user's tracked
@@ -565,14 +568,29 @@ function formatSeverityThresholdLine(threshold: number): string {
   );
 }
 
-function getRecentAlertContext(spaceId: string): AlertContext | null {
-  const ctx = lastAlertBySpace.get(spaceId);
-  if (!ctx) return null;
-  if (Date.now() - ctx.sentAt > ALERT_CONTEXT_TTL_MS) {
-    lastAlertBySpace.delete(spaceId);
-    return null;
+function pruneAlertHistory(spaceId: string): AlertContext[] {
+  const history = alertHistoryBySpace.get(spaceId) ?? [];
+  const now = Date.now();
+  const fresh = history.filter((ctx) => now - ctx.sentAt <= ALERT_CONTEXT_TTL_MS);
+  if (fresh.length !== history.length) {
+    alertHistoryBySpace.set(spaceId, fresh);
   }
-  return ctx;
+  return fresh;
+}
+
+// Return the most recent non-expired alert (used for text-heuristic follow-ups).
+function getRecentAlertContext(spaceId: string): AlertContext | null {
+  return pruneAlertHistory(spaceId)[0] ?? null;
+}
+
+// Return the specific alert a thread reply is targeting, or null if it doesn't
+// match any of our stored alerts or has expired.
+function getAlertContextForThread(
+  spaceId: string,
+  targetMessageId: string,
+): AlertContext | null {
+  const fresh = pruneAlertHistory(spaceId);
+  return fresh.find((ctx) => ctx.alertMessageId === targetMessageId) ?? null;
 }
 
 function rememberAlertContext(
@@ -580,13 +598,19 @@ function rememberAlertContext(
   headline: string,
   source: string,
   analysis: HeadlineAnalysis,
+  alertMessageId?: string,
 ): void {
-  lastAlertBySpace.set(spaceId, {
+  const ctx: AlertContext = {
     headline,
     source,
     analysis,
     sentAt: Date.now(),
-  });
+    alertMessageId,
+  };
+  const history = alertHistoryBySpace.get(spaceId) ?? [];
+  history.unshift(ctx); // newest first
+  if (history.length > ALERT_HISTORY_MAX) history.length = ALERT_HISTORY_MAX;
+  alertHistoryBySpace.set(spaceId, history);
 }
 
 function looksLikeAlertFollowUp(text: string): boolean {
@@ -643,20 +667,23 @@ function looksLikePreferenceUpdate(text: string): boolean {
   return patterns.some((p) => p.test(t));
 }
 
-function shouldHandleAsAlertFollowUp(
-  text: string,
-  spaceId: string,
-): boolean {
-  if (!getRecentAlertContext(spaceId)) return false;
-  if (looksLikePreferenceUpdate(text)) return false;
-  return looksLikeAlertFollowUp(text);
+// Returns the list of recent unexpired alerts if the message looks like a
+// follow-up question, or an empty array if it should be handled as a
+// preference update / unrecognised message.
+function getFollowUpAlerts(text: string, spaceId: string): AlertContext[] {
+  const history = pruneAlertHistory(spaceId);
+  if (history.length === 0) return [];
+  if (looksLikePreferenceUpdate(text)) return [];
+  if (!looksLikeAlertFollowUp(text)) return [];
+  return history;
 }
 
-function formatAlertContextForLlm(ctx: AlertContext): string {
+function formatAlertContextForLlm(ctx: AlertContext, index?: number): string {
   const sentimentLabel = formatSentimentLabel(ctx.analysis.sentiment);
   const trustLabel = formatTrustLabel(ctx.analysis.sourceTrust);
+  const prefix = index !== undefined ? `Alert ${index + 1}:\n` : "";
   const lines = [
-    `Headline: ${ctx.headline}`,
+    `${prefix}Headline: ${ctx.headline}`,
     `Source: ${ctx.source || "unknown"} (trust ${trustLabel}, ${ctx.analysis.sourceTrust.toFixed(2)})`,
     `Severity: ${ctx.analysis.severity.toFixed(2)}`,
     `Direction: ${sentimentLabel} (${ctx.analysis.sentiment.toFixed(2)})`,
@@ -667,17 +694,32 @@ function formatAlertContextForLlm(ctx: AlertContext): string {
   return lines.join("\n");
 }
 
+// Answer a follow-up question about one or more recent alerts. When multiple
+// alerts are passed the LLM infers which one(s) the question is about.
 async function answerAlertFollowUp(
   question: string,
-  ctx: AlertContext,
+  alerts: AlertContext[],
 ): Promise<string> {
-  const system =
-    "You are a macro trading analyst helping a user understand a news alert they received. " +
-    "Use the alert context below. Answer clearly in plain text for iMessage (no JSON, no markdown code fences). " +
-    "Be specific about market implications when relevant. Keep under ~400 words unless they asked for a full report summary.";
+  const multiAlert = alerts.length > 1;
+
+  const system = multiAlert
+    ? "You are a macro trading analyst helping a user understand their recent news alerts. " +
+      "The user has several recent alerts listed below (newest first). " +
+      "Read their question and answer it, drawing on whichever alert is most relevant. " +
+      "If the question clearly references a specific alert (by topic, ticker, or wording), answer about that one. " +
+      "If it's ambiguous, answer about the most relevant alert and briefly note which one you're addressing. " +
+      "Answer clearly in plain text for iMessage (no JSON, no markdown). " +
+      "Be specific about market implications. Keep under ~400 words unless asked for a full report summary."
+    : "You are a macro trading analyst helping a user understand a news alert they received. " +
+      "Use the alert context below. Answer clearly in plain text for iMessage (no JSON, no markdown code fences). " +
+      "Be specific about market implications when relevant. Keep under ~400 words unless they asked for a full report summary.";
+
+  const alertsText = multiAlert
+    ? alerts.map((ctx, i) => formatAlertContextForLlm(ctx, i)).join("\n\n")
+    : formatAlertContextForLlm(alerts[0]!);
 
   const user =
-    `Alert context:\n${formatAlertContextForLlm(ctx)}\n\n` +
+    `${multiAlert ? "Recent alerts" : "Alert context"}:\n${alertsText}\n\n` +
     `User follow-up: ${question}`;
 
   return grokChatCompletion(system, user, "Alert follow-up");
@@ -799,8 +841,8 @@ async function dispatchHeadlineAlerts(
         const prefs = userPreferences.get(spaceId);
         if (!prefs || !shouldAlertUser(headline, analysis, prefs)) return false;
 
-        await sendWithRetry("alert", () => app.send(space, alert));
-        rememberAlertContext(spaceId, headline, source, analysis);
+        const outMsg = await sendWithRetry("alert", () => app.send(space, alert));
+        rememberAlertContext(spaceId, headline, source, analysis, outMsg?.id);
         return true;
       });
       if (sent) {
@@ -1079,14 +1121,34 @@ async function main(): Promise<void> {
       );
       continue;
     }
-    if (message.content.type !== "text") {
+    if (message.content.type !== "text" && message.content.type !== "reply") {
       console.log(
-        `[iMessage] skipped: content type is '${String(message.content.type)}', not 'text'`,
+        `[iMessage] skipped: content type is '${String(message.content.type)}', not 'text' or 'reply'`,
       );
       continue;
     }
 
-    const text = message.content.text;
+    // For thread replies extract the inner text and the id of the replied-to message.
+    let text: string;
+    let replyToMessageId: string | null = null;
+
+    if (message.content.type === "reply") {
+      const replyContent = message.content as unknown as {
+        type: "reply";
+        content: { type: string; text?: string };
+        target: { id: string };
+      };
+      const inner = replyContent.content;
+      if (inner.type !== "text" || !inner.text?.trim()) {
+        console.log("[iMessage] skipped: reply inner content is not text");
+        continue;
+      }
+      text = inner.text;
+      replyToMessageId = replyContent.target.id;
+    } else {
+      text = message.content.text;
+    }
+
     const spaceId = space.id;
     spacesById.set(spaceId, space);
 
@@ -1125,18 +1187,33 @@ async function main(): Promise<void> {
     void spaceOutbound
       .run(spaceId, "user", async () => {
         const releaseAlertHold = spaceOutbound.holdAlerts(spaceId);
-        const isAlertFollowUp = shouldHandleAsAlertFollowUp(text, spaceId);
+
+        // Build the list of alert contexts relevant to this message.
+        //
+        // Best-case: the message is a Spectrum-level thread reply (content.type
+        // === "reply") targeting one of our alert messages — use just that alert.
+        //
+        // For iMessage the platform provider does NOT expose the thread originator
+        // GUID on plain inbound text messages, so long-press → Reply arrives here
+        // as a regular text message. In that case we fall back to the keyword
+        // heuristic and pass ALL recent unexpired alerts to the LLM so it can
+        // infer which one the question is about from the text alone.
+        //
+        // Thread reply to a non-alert message → empty list → handled as
+        // preference update.
+        let followUpAlerts: AlertContext[] = [];
+        if (replyToMessageId !== null) {
+          const matched = getAlertContextForThread(spaceId, replyToMessageId);
+          if (matched) followUpAlerts = [matched];
+          // No match → user replied to a non-alert message; treat as preference update.
+        } else {
+          followUpAlerts = getFollowUpAlerts(text, spaceId);
+        }
+
+        const isAlertFollowUp = followUpAlerts.length > 0;
 
         try {
           if (isAlertFollowUp) {
-            const alertCtx = getRecentAlertContext(spaceId);
-            if (!alertCtx) {
-              await message.reply(
-                "I don't have a recent alert in context — ask again after your next macro alert.",
-              );
-              return;
-            }
-
             if (!process.env.XAI_API_KEY) {
               await message.reply(
                 "I need an API key configured to answer follow-up questions.",
@@ -1144,8 +1221,11 @@ async function main(): Promise<void> {
               return;
             }
 
-            console.log(`[iMessage] alert follow-up space=${spaceId}: ${text}`);
-            const answer = await answerAlertFollowUp(text, alertCtx);
+            const followUpSource = replyToMessageId ? "thread reply" : "heuristic";
+            console.log(
+              `[iMessage] alert follow-up (${followUpSource}, ${followUpAlerts.length} alert(s)) space=${spaceId}: ${text}`,
+            );
+            const answer = await answerAlertFollowUp(text, followUpAlerts);
             await sendWithRetry("alert follow-up reply", () =>
               message.reply(answer),
             );
