@@ -17,7 +17,7 @@ it into one of three buckets:
 ## 1. Setting alert preferences
 
 Anything that isn't a follow-up to a recent alert is parsed as a preference
-update. The agent extracts four things from your message:
+update. The agent extracts five things from your message:
 
 | Field | What it is | Example phrasing |
 | --- | --- | --- |
@@ -25,6 +25,7 @@ update. The agent extracts four things from your message:
 | `watchlist` | Explicit **stock tickers** you care about | "watch TSLA and NVDA for me" |
 | `severityThreshold` | Minimum **market impact** to alert, 0–1 (lower = more alerts) | "only the big stuff, threshold 0.8" |
 | `sourceTrustThreshold` | Minimum publisher trustworthiness, 0–1 (higher = stricter) | "only alert me from reputable sources" |
+| `alertsPaused` | Whether proactive alerts are temporarily paused | "pause alerts", "resume alerts" |
 
 You can combine them in one message, or send them across several — you don't
 have to restate everything each time. Examples:
@@ -38,6 +39,7 @@ The agent replies with a confirmation echoing your **current** settings, e.g.:
 
 ```
 Got it — saved your macro preferences for this chat.
+Alerts: active
 Tracked keywords: CPI, FOMC
 Watchlist: TSLA, NVDA
 Severity threshold: 0.5
@@ -88,10 +90,15 @@ start over:
 | **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6, any source) |
 | **Set impact threshold** | `threshold 0.5`, `only big alerts` | changes how market-moving news must be |
 | **Filter by source** | `only reputable sources`, `any source is fine` | sets/clears the minimum source-trust level |
+| **Pause/resume alerts** | `pause alerts`, `resume alerts` | keeps settings but suppresses/restores proactive alerts |
 
 Add/remove are case-insensitive, so `untrack cpi` removes `CPI`. Replacing or
 clearing one list (e.g. the watchlist) leaves your keywords and threshold
 untouched.
+
+Pausing alerts is also incremental: it keeps your keywords, watchlist, severity
+threshold, and source-trust threshold unchanged. Text `resume alerts` to turn
+proactive alerts back on.
 
 ### What triggers a watchlist alert
 
@@ -138,9 +145,9 @@ must clear **all** of them to alert.
 ### Defaults
 
 A brand-new chat starts at `trackedKeywords = []`, `watchlist = []`,
-`severityThreshold = 0.6`, `sourceTrustThreshold = 0` (any source). An empty
-keyword **and** watchlist set means "match every headline" (subject to the
-thresholds).
+`severityThreshold = 0.6`, `sourceTrustThreshold = 0` (any source), and
+`alertsPaused = false`. An empty keyword **and** watchlist set means "match every
+headline" (subject to the thresholds).
 
 If a message can't be understood (or the LLM call fails), your saved settings
 are left **unchanged** — a bad parse can no longer wipe what you had.
@@ -186,5 +193,7 @@ me on CPI") and it'll be saved rather than answered.
 | Get fewer / only big alerts | `threshold 0.8` |
 | Get more alerts | `threshold 0.3` |
 | Only trust reputable sources | `only alert me from reputable sources` |
+| Pause proactive alerts | `pause alerts` |
+| Resume proactive alerts | `resume alerts` |
 | Ask about a recent alert | `why is this hawkish?`, `what does the Waller news mean?` |
 | See what's saved | send any preference message; the reply echoes it back |

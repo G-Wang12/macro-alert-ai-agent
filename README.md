@@ -192,17 +192,26 @@ deployment.
 
 ### Local Docker smoke test
 
+Use Docker when you want to test the same shape Railway will run: one container
+that builds and starts both `cpp_engine` and `ts_agent`.
+
 ```bash
-docker build -t macro-alert-ai-agent .
-docker run --rm \
-  -e XAI_API_KEY=... \
-  -e PROJECT_ID=... \
-  -e PROJECT_SECRET=... \
-  macro-alert-ai-agent
+docker build -t macro-alert-ai-agent:local .
+docker run --rm --env-file ts_agent/.env macro-alert-ai-agent:local
 ```
 
-This uses simulated headlines by default. Spectrum and Grok still require their
-own credentials for the full iMessage flow.
+This passes your local `ts_agent/.env` into the container at runtime without
+copying secrets into the image. The startup script supplies local ZeroMQ
+defaults (`tcp://127.0.0.1:5555` and `tcp://127.0.0.1:5556`) and uses simulated
+headlines by default. A healthy run starts with logs like:
+
+```text
+Starting cpp_engine with args: --simulate tcp://127.0.0.1:5555
+Starting ts_agent
+```
+
+Rebuild the image after Dockerfile, C++, TypeScript, or script changes. Use
+Ctrl+C to stop the container.
 
 ### Dynamic filter sync
 

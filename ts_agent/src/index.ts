@@ -23,6 +23,8 @@ type UserPreferences = {
   // Minimum source trustworthiness (0..1) required to alert. 0 = no filtering
   // (alert regardless of source); higher values suppress low-trust publishers.
   sourceTrustThreshold: number;
+  // When true, keep settings but suppress proactive alerts until resumed.
+  alertsPaused: boolean;
 };
 
 // A single inbound message is treated as an incremental change to existing
@@ -31,8 +33,8 @@ type UserPreferences = {
 //
 // Per list: `replace*` (non-null) sets the list to exactly that value — an empty
 // array clears just that list — and takes precedence over add/remove. Otherwise
-// `add*` then `remove*` are applied. `severityThreshold: null` means untouched.
-// `clearAll` resets everything to defaults.
+// `add*` then `remove*` are applied. `severityThreshold: null` and
+// `alertsPaused: null` mean untouched. `clearAll` resets everything to defaults.
 type PreferenceUpdate = {
   addKeywords: string[];
   removeKeywords: string[];
@@ -42,6 +44,7 @@ type PreferenceUpdate = {
   replaceTickers: string[] | null;
   severityThreshold: number | null;
   sourceTrustThreshold: number | null;
+  alertsPaused: boolean | null;
   clearAll: boolean;
 };
 
@@ -50,6 +53,7 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   severityThreshold: 0.6,
   watchlist: [],
   sourceTrustThreshold: 0,
+  alertsPaused: false,
 };
 
 type HeadlineMessage = {
@@ -232,8 +236,37 @@ const NOOP_PREFERENCE_UPDATE: PreferenceUpdate = {
   replaceTickers: null,
   severityThreshold: null,
   sourceTrustThreshold: null,
+  alertsPaused: null,
   clearAll: false,
 };
+
+function detectPauseUpdate(userText: string): boolean | null {
+  const t = userText.trim().toLowerCase();
+  if (!t) return null;
+
+  const resumePatterns = [
+    /\bresume alerts?\b/,
+    /\bunpause alerts?\b/,
+    /\bunmute alerts?\b/,
+    /\bturn alerts? back on\b/,
+    /\benable alerts?\b/,
+    /\bstart alerts?\b/,
+    /\bstart alerting\b/,
+  ];
+  if (resumePatterns.some((p) => p.test(t))) return false;
+
+  const pausePatterns = [
+    /\bpause alerts?\b/,
+    /\bmute alerts?\b/,
+    /\bsnooze alerts?\b/,
+    /\bdisable alerts?\b/,
+    /\bturn alerts? off\b/,
+    /\bstop all alerts?\b/,
+  ];
+  if (pausePatterns.some((p) => p.test(t))) return true;
+
+  return null;
+}
 
 // Parse the LLM's incremental-update JSON. Returns a no-op update for anything
 // malformed — never throws away existing prefs. A `replace*` field is honored
@@ -264,6 +297,9 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
     sourceTrustThreshold = Math.max(0, Math.min(1, obj.sourceTrustThreshold));
   }
 
+  const alertsPaused =
+    typeof obj.alertsPaused === "boolean" ? obj.alertsPaused : null;
+
   return {
     addKeywords: toStringList(obj.addKeywords),
     removeKeywords: toStringList(obj.removeKeywords),
@@ -273,6 +309,7 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
     replaceTickers: replaceTickersRaw === null ? null : upper(replaceTickersRaw),
     severityThreshold,
     sourceTrustThreshold,
+    alertsPaused,
     clearAll: obj.clearAll === true,
   };
 }
@@ -329,6 +366,7 @@ function mergePreferences(
       watchlist: [],
       severityThreshold: DEFAULT_PREFERENCES.severityThreshold,
       sourceTrustThreshold: DEFAULT_PREFERENCES.sourceTrustThreshold,
+      alertsPaused: DEFAULT_PREFERENCES.alertsPaused,
     };
   }
   return {
@@ -349,6 +387,7 @@ function mergePreferences(
     severityThreshold: update.severityThreshold ?? current.severityThreshold,
     sourceTrustThreshold:
       update.sourceTrustThreshold ?? current.sourceTrustThreshold,
+    alertsPaused: update.alertsPaused ?? current.alertsPaused,
   };
 }
 
@@ -538,6 +577,7 @@ function shouldAlertUser(
   analysis: HeadlineAnalysis,
   prefs: UserPreferences,
 ): boolean {
+  if (prefs.alertsPaused) return false;
   // Watchlist tickers act as additional match terms alongside macro keywords,
   // so news about a watched stock triggers an alert even if no keyword matches.
   const matchTerms = [...prefs.trackedKeywords, ...(prefs.watchlist ?? [])];
@@ -654,7 +694,16 @@ function looksLikePreferenceUpdate(text: string): boolean {
     /\bpreference/,
     /\binterested in\b/,
     /\bonly (alert|notify|watch|track)\b/,
+    /\bpause alerts?\b/,
+    /\bresume alerts?\b/,
+    /\bunpause alerts?\b/,
+    /\bmute alerts?\b/,
+    /\bunmute alerts?\b/,
+    /\bdisable alerts?\b/,
+    /\benable alerts?\b/,
+    /\bturn alerts? (off|on|back on)\b/,
     /\bstop alerting\b/,
+    /\bstop alerts?\b/,
     /\bstop watching\b/,
     /\buntrack\b/,
     /\bremove\b/,
@@ -911,6 +960,11 @@ async function runZmqHeadlineSubscriber(
 async function extractPreferenceUpdate(
   userText: string,
 ): Promise<PreferenceUpdate> {
+  const alertsPaused = detectPauseUpdate(userText);
+  if (alertsPaused !== null) {
+    return { ...NOOP_PREFERENCE_UPDATE, alertsPaused };
+  }
+
   if (!process.env.XAI_API_KEY) {
     console.warn(
       "ts_agent: XAI_API_KEY is not set (or is empty) — no preference change.",
@@ -937,18 +991,22 @@ async function extractPreferenceUpdate(
     "(higher = stricter, only more credible publishers). Map phrasing to a number: " +
     "'only high-trust/reputable sources' -> ~0.7, 'trusted sources only' -> ~0.6, 'skip blogs/tabloids/PR wires' -> ~0.5, " +
     "'any source is fine' / 'stop filtering sources' -> 0; else null.\n" +
+    "  alertsPaused (boolean or null): true if the user asks to pause/mute/snooze/disable/stop all alerts; " +
+    "false if they ask to resume/unpause/unmute/enable/start alerts; otherwise null.\n" +
     "  clearAll (boolean): true ONLY if the user wants to reset/clear ALL settings.\n" +
     "Rules: do not invent tickers — only ones the user names. Use add/remove for incremental changes; " +
     "use replace* only for 'only/just/set to' phrasing; an empty replace* array clears just that list. " +
-    "Default everything to empty arrays / null / false when the message doesn't mention it.\n" +
+    "Default arrays to [] and nullable fields to null when the message doesn't mention them; default clearAll to false.\n" +
     'Examples:\n' +
-    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"severityThreshold":0.3,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":0.7,"clearAll":false}\n' +
-    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":true}';
+    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"severityThreshold":0.3,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
+    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
+    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
+    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
+    '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":0.7,"alertsPaused":null,"clearAll":false}\n' +
+    '  "pause alerts" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":true,"clearAll":false}\n' +
+    '  "resume alerts" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":false,"clearAll":false}\n' +
+    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":false}\n' +
+    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"alertsPaused":null,"clearAll":true}';
 
   let content: string;
   try {
@@ -1254,6 +1312,7 @@ async function main(): Promise<void> {
               : "any source";
           const confirmation =
             `Got it — saved your macro preferences for this chat.\n` +
+            `Alerts: ${prefs.alertsPaused ? "paused" : "active"}\n` +
             `Tracked keywords: ${keywordsPretty}\n` +
             `Watchlist: ${watchlistPretty}\n` +
             `${formatSeverityThresholdLine(prefs.severityThreshold)}\n` +
