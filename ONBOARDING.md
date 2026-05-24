@@ -119,7 +119,8 @@ The agent replies with something like:
 Got it — saved your macro preferences for this chat.
 Tracked keywords: CPI, FOMC
 Watchlist: (none)
-Sentiment threshold: 0.5
+Severity threshold: 0.5
+Alerts when a matching headline's Severity score is ≥ 0.5 (same "Severity" on each alert; not bullish/bearish Direction). Lower = more alerts.
 Source trust: any source
 ```
 

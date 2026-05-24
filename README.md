@@ -187,7 +187,7 @@ Checklist:
 
 Troubleshooting (preferences):
 
-- If you get `Got it — saved...` but `Tracked keywords: (none)` and `Sentiment threshold: 0.6`, the agent fell back to defaults (most commonly because `XAI_API_KEY` is missing/blank, or the LLM output wasn't parseable).
+- If you get `Got it — saved...` but `Tracked keywords: (none)` and `Severity threshold: 0.6`, the agent fell back to defaults (most commonly because `XAI_API_KEY` is missing/blank, or the LLM output wasn't parseable).
 - If you get `Sorry — I couldn't update your preferences right now.`, the LLM call failed (network/API/model error). Check the agent console logs for the error.
 - If an alert arrives before your “Got it — saved…” reply, restart the agent after `npm run build` — the agent holds alerts while your settings message is being processed so confirmations should arrive first.
 - If you get multiple identical replies for a single text, you likely have multiple `npm start` processes running at once. Stop extras (Ctrl+C) so only one agent instance is connected.
@@ -198,8 +198,8 @@ Troubleshooting (preferences):
 After saving preferences (above), leave `npm start` running with `cpp_engine` publishing:
 
 1. Watch the agent console for `[ZMQ] headline: ... [source: ...]` when a headline is received.
-2. If the headline matches your keywords **or watchlist tickers**, Grok’s **severity** is at or above your **sentiment threshold**, and the **source trust** Grok assigns the publisher is at or above your **source-trust threshold** (default 0 = any source), you should get a proactive iMessage (no new inbound message required). The alert names the source and its trust level, e.g. `Source: Reuters · trust high (0.95)`.
-3. Lower threshold → more alerts; higher threshold → fewer. Raise the source-trust threshold (e.g. "only reputable sources") to suppress low-credibility publishers — see [`MESSAGING.md`](MESSAGING.md).
+2. If the headline matches your keywords **or watchlist tickers**, Grok’s **severity** score is at or above your **severity threshold** (what you set with `threshold 0.5`, etc.), and the **source trust** Grok assigns the publisher is at or above your **source-trust threshold** (default 0 = any source), you should get a proactive iMessage (no new inbound message required). The alert names the source and its trust level, e.g. `Source: Reuters · trust high (0.95)`.
+3. Lower severity threshold → more alerts; higher → fewer. This filters on **how market-moving** the headline is — not bullish/bearish direction (direction is shown on the alert but not filtered). Raise the source-trust threshold (e.g. "only reputable sources") to suppress low-credibility publishers — see [`MESSAGING.md`](MESSAGING.md).
 
 #### Testing the watchlist specifically
 

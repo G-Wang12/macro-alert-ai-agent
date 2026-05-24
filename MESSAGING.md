@@ -23,7 +23,7 @@ update. The agent extracts four things from your message:
 | --- | --- | --- |
 | `trackedKeywords` | Macro/news triggers to match headlines against | "alert me on CPI, FOMC, and Powell" |
 | `watchlist` | Explicit **stock tickers** you care about | "watch TSLA and NVDA for me" |
-| `sentimentThreshold` | Sensitivity, 0–1 (lower = more alerts) | "only the big stuff, threshold 0.8" |
+| `severityThreshold` | Minimum **market impact** to alert, 0–1 (lower = more alerts) | "only the big stuff, threshold 0.8" |
 | `sourceTrustThreshold` | Minimum publisher trustworthiness, 0–1 (higher = stricter) | "only alert me from reputable sources" |
 
 You can combine them in one message, or send them across several — you don't
@@ -40,9 +40,27 @@ The agent replies with a confirmation echoing your **current** settings, e.g.:
 Got it — saved your macro preferences for this chat.
 Tracked keywords: CPI, FOMC
 Watchlist: TSLA, NVDA
-Sentiment threshold: 0.5
+Severity threshold: 0.5
+Alerts when a matching headline's Severity score is ≥ 0.5 (same "Severity" on each alert; not bullish/bearish Direction). Lower = more alerts.
 Source trust: any source
 ```
+
+### What “threshold” means (severity, not direction)
+
+When you text `threshold 0.5`, you are setting your **severity threshold** — how
+**market-moving** a headline must be before you get pinged. After a headline matches your keywords or
+watchlist, Grok scores it on three separate 0–1 scales:
+
+| Score on each alert | What it measures | Used to filter alerts? |
+| --- | --- | --- |
+| **Severity** | How market-moving the headline is (CPI surprise, FOMC shock, etc.) | **Yes** — compared to your **severity threshold** |
+| **Direction** | Bearish vs bullish tone | **No** — shown for context only |
+| **Source trust** | Publisher credibility (Reuters high, PR wire low) | **Yes** — if you set a source-trust minimum |
+
+So **`threshold 0.5` sets your severity threshold** — “only alert me when severity ≥
+0.5.” It does **not** mean “only bearish news” or “only bullish news.” Lower the
+number for more alerts; raise it (e.g. `threshold 0.8`) for fewer, bigger
+headlines only.
 
 **Updates are incremental.** Each message changes only what it mentions; the
 rest of your settings are kept. So this works as a conversation:
@@ -68,7 +86,7 @@ start over:
 | **Replace a list** | `only watch TSLA`, `just track CPI and FOMC` | sets that one list to exactly what you named |
 | **Clear one list** | `clear my watchlist` | empties that list, keeps the rest |
 | **Reset everything** | `reset my settings`, `clear everything` | back to defaults (no keywords/tickers, threshold 0.6, any source) |
-| **Set threshold** | `threshold 0.5`, `only big alerts` | changes only the sensitivity |
+| **Set impact threshold** | `threshold 0.5`, `only big alerts` | changes how market-moving news must be |
 | **Filter by source** | `only reputable sources`, `any source is fine` | sets/clears the minimum source-trust level |
 
 Add/remove are case-insensitive, so `untrack cpi` removes `CPI`. Replacing or
@@ -78,7 +96,7 @@ untouched.
 ### What triggers a watchlist alert
 
 A watched ticker behaves like an extra keyword: a headline alerts you if it
-mentions the ticker **and** the headline's severity is at or above your
+mentions the ticker **and** the headline's **market impact** is at or above your
 threshold. Tickers and tracked keywords are matched as a combined set, so you
 don't need to also list a ticker under keywords.
 
@@ -99,7 +117,7 @@ each alert is labelled `low` / `medium` / `high`:
 Macro alert
 Fed raises rates by 25bps, signals higher-for-longer stance
 Source: Reuters · trust high (0.95)
-Severity: 0.90 | Sentiment: bearish (0.20)
+Severity: 0.90 | Direction: bearish (0.20)
 ...
 ```
 
@@ -114,13 +132,13 @@ only want credible publishers, set a minimum:
 | `any source is fine` | turns the filter off (back to 0) |
 
 The trust threshold is per chat and incremental like your other settings, and it
-stacks with your keyword/watchlist match and sentiment threshold — a headline
+stacks with your keyword/watchlist match and impact threshold — a headline
 must clear **all** of them to alert.
 
 ### Defaults
 
 A brand-new chat starts at `trackedKeywords = []`, `watchlist = []`,
-`sentimentThreshold = 0.6`, `sourceTrustThreshold = 0` (any source). An empty
+`severityThreshold = 0.6`, `sourceTrustThreshold = 0` (any source). An empty
 keyword **and** watchlist set means "match every headline" (subject to the
 thresholds).
 

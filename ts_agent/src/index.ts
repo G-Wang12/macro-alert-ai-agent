@@ -16,7 +16,9 @@ import { SpaceOutboundCoordinator } from "./spaceOutbound.js";
 
 type UserPreferences = {
   trackedKeywords: string[];
-  sentimentThreshold: number; // 0..1
+  // Minimum headline market-impact score (0..1) required to send an alert.
+  // Compared against Grok's `severity` rating — not bullish/bearish sentiment.
+  severityThreshold: number;
   watchlist?: string[]; // explicit stock tickers the user mentioned
   // Minimum source trustworthiness (0..1) required to alert. 0 = no filtering
   // (alert regardless of source); higher values suppress low-trust publishers.
@@ -29,7 +31,7 @@ type UserPreferences = {
 //
 // Per list: `replace*` (non-null) sets the list to exactly that value — an empty
 // array clears just that list — and takes precedence over add/remove. Otherwise
-// `add*` then `remove*` are applied. `sentimentThreshold: null` means untouched.
+// `add*` then `remove*` are applied. `severityThreshold: null` means untouched.
 // `clearAll` resets everything to defaults.
 type PreferenceUpdate = {
   addKeywords: string[];
@@ -38,14 +40,14 @@ type PreferenceUpdate = {
   addTickers: string[];
   removeTickers: string[];
   replaceTickers: string[] | null;
-  sentimentThreshold: number | null;
+  severityThreshold: number | null;
   sourceTrustThreshold: number | null;
   clearAll: boolean;
 };
 
 const DEFAULT_PREFERENCES: UserPreferences = {
   trackedKeywords: [],
-  sentimentThreshold: 0.6,
+  severityThreshold: 0.6,
   watchlist: [],
   sourceTrustThreshold: 0,
 };
@@ -225,7 +227,7 @@ const NOOP_PREFERENCE_UPDATE: PreferenceUpdate = {
   addTickers: [],
   removeTickers: [],
   replaceTickers: null,
-  sentimentThreshold: null,
+  severityThreshold: null,
   sourceTrustThreshold: null,
   clearAll: false,
 };
@@ -244,12 +246,11 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
 
   const replaceTickersRaw = asListOrNull(obj.replaceTickers);
 
-  let sentimentThreshold: number | null = null;
-  if (
-    typeof obj.sentimentThreshold === "number" &&
-    Number.isFinite(obj.sentimentThreshold)
-  ) {
-    sentimentThreshold = Math.max(0, Math.min(1, obj.sentimentThreshold));
+  let severityThreshold: number | null = null;
+  const thresholdRaw =
+    obj.severityThreshold ?? obj.sentimentThreshold; // legacy LLM key
+  if (typeof thresholdRaw === "number" && Number.isFinite(thresholdRaw)) {
+    severityThreshold = Math.max(0, Math.min(1, thresholdRaw));
   }
 
   let sourceTrustThreshold: number | null = null;
@@ -267,7 +268,7 @@ function normalizePreferenceUpdate(maybe: unknown): PreferenceUpdate {
     addTickers: upper(toStringList(obj.addTickers)),
     removeTickers: upper(toStringList(obj.removeTickers)),
     replaceTickers: replaceTickersRaw === null ? null : upper(replaceTickersRaw),
-    sentimentThreshold,
+    severityThreshold,
     sourceTrustThreshold,
     clearAll: obj.clearAll === true,
   };
@@ -323,7 +324,7 @@ function mergePreferences(
     return {
       trackedKeywords: [],
       watchlist: [],
-      sentimentThreshold: DEFAULT_PREFERENCES.sentimentThreshold,
+      severityThreshold: DEFAULT_PREFERENCES.severityThreshold,
       sourceTrustThreshold: DEFAULT_PREFERENCES.sourceTrustThreshold,
     };
   }
@@ -342,7 +343,7 @@ function mergePreferences(
       update.replaceTickers,
       true,
     ),
-    sentimentThreshold: update.sentimentThreshold ?? current.sentimentThreshold,
+    severityThreshold: update.severityThreshold ?? current.severityThreshold,
     sourceTrustThreshold:
       update.sourceTrustThreshold ?? current.sourceTrustThreshold,
   };
@@ -538,7 +539,7 @@ function shouldAlertUser(
   // so news about a watched stock triggers an alert even if no keyword matches.
   const matchTerms = [...prefs.trackedKeywords, ...(prefs.watchlist ?? [])];
   if (!matchesUserKeywords(headline, matchTerms)) return false;
-  if (analysis.severity < prefs.sentimentThreshold) return false;
+  if (analysis.severity < prefs.severityThreshold) return false;
   // Suppress headlines from sources the user deems insufficiently trustworthy.
   // Threshold 0 (the default) lets everything through regardless of source.
   return analysis.sourceTrust >= prefs.sourceTrustThreshold;
@@ -554,6 +555,14 @@ function formatTrustLabel(trust: number): string {
   if (trust >= 0.7) return "high";
   if (trust >= 0.4) return "medium";
   return "low";
+}
+
+function formatSeverityThresholdLine(threshold: number): string {
+  return (
+    `Severity threshold: ${threshold}\n` +
+    `Alerts when a matching headline's Severity score is ≥ ${threshold} ` +
+    `(same "Severity" on each alert; not bullish/bearish Direction). Lower = more alerts.`
+  );
 }
 
 function getRecentAlertContext(spaceId: string): AlertContext | null {
@@ -650,7 +659,7 @@ function formatAlertContextForLlm(ctx: AlertContext): string {
     `Headline: ${ctx.headline}`,
     `Source: ${ctx.source || "unknown"} (trust ${trustLabel}, ${ctx.analysis.sourceTrust.toFixed(2)})`,
     `Severity: ${ctx.analysis.severity.toFixed(2)}`,
-    `Sentiment: ${sentimentLabel} (${ctx.analysis.sentiment.toFixed(2)})`,
+    `Direction: ${sentimentLabel} (${ctx.analysis.sentiment.toFixed(2)})`,
   ];
   if (ctx.analysis.summary) {
     lines.push(`Summary: ${ctx.analysis.summary}`);
@@ -685,7 +694,7 @@ function formatAlertMessage(
     "Macro alert",
     headline,
     `Source: ${source || "unknown"} · trust ${trustLabel} (${analysis.sourceTrust.toFixed(2)})`,
-    `Severity: ${analysis.severity.toFixed(2)} | Sentiment: ${sentimentLabel} (${analysis.sentiment.toFixed(2)})`,
+    `Severity: ${analysis.severity.toFixed(2)} | Direction: ${sentimentLabel} (${analysis.sentiment.toFixed(2)})`,
   ];
   if (analysis.summary) {
     lines.push(analysis.summary);
@@ -870,7 +879,7 @@ async function extractPreferenceUpdate(
   const system =
     "You read ONE chat message and translate it into an incremental change to the " +
     "user's macro trading alert settings (tracked macro keywords, a watchlist of stock " +
-    "tickers, a sensitivity threshold, and a minimum source-trust threshold). Report ONLY " +
+    "tickers, a minimum market-impact threshold, and a minimum source-trust threshold). Report ONLY " +
     "what THIS message asks for; never restate prior settings.\n" +
     "Return ONLY valid JSON with these keys:\n" +
     "  addKeywords (string[]): macro/news triggers to ADD (e.g. CPI, FOMC, rates, Powell, inflation).\n" +
@@ -879,7 +888,9 @@ async function extractPreferenceUpdate(
     "  addTickers (string[]): stock tickers to ADD, uppercased (e.g. AAPL, TSLA, NVDA).\n" +
     "  removeTickers (string[]): tickers to REMOVE (user says stop watching/remove/drop).\n" +
     "  replaceTickers (string[] or null): set watchlist to EXACTLY this list (user says 'only watch …'); else null.\n" +
-    "  sentimentThreshold (number 0..1 or null): set ONLY if the user specifies sensitivity (lower = more alerts); else null.\n" +
+    "  severityThreshold (number 0..1 or null): set ONLY if the user specifies how big news must be to alert " +
+    "(compared against Grok's market-impact score on each headline; lower = more alerts, higher = only big news). " +
+    "Phrases like 'threshold 0.5' or 'only big alerts' map here. NOT bullish/bearish sentiment. else null.\n" +
     "  sourceTrustThreshold (number 0..1 or null): set ONLY if the user wants to filter by how trustworthy the news SOURCE is " +
     "(higher = stricter, only more credible publishers). Map phrasing to a number: " +
     "'only high-trust/reputable sources' -> ~0.7, 'trusted sources only' -> ~0.6, 'skip blogs/tabloids/PR wires' -> ~0.5, " +
@@ -889,13 +900,13 @@ async function extractPreferenceUpdate(
     "use replace* only for 'only/just/set to' phrasing; an empty replace* array clears just that list. " +
     "Default everything to empty arrays / null / false when the message doesn't mention it.\n" +
     'Examples:\n' +
-    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":0.3,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":0.7,"clearAll":false}\n' +
-    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
-    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"sentimentThreshold":null,"sourceTrustThreshold":null,"clearAll":true}';
+    '  "watch GOOGL and AMZN, threshold 0.3" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":["GOOGL","AMZN"],"removeTickers":[],"replaceTickers":null,"severityThreshold":0.3,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "stop watching GOOGL" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":["GOOGL"],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "untrack CPI" -> {"addKeywords":[],"removeKeywords":["CPI"],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "only watch TSLA" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":["TSLA"],"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "only alert me from reputable sources" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":0.7,"clearAll":false}\n' +
+    '  "clear my watchlist" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":[],"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":false}\n' +
+    '  "reset everything" -> {"addKeywords":[],"removeKeywords":[],"replaceKeywords":null,"addTickers":[],"removeTickers":[],"replaceTickers":null,"severityThreshold":null,"sourceTrustThreshold":null,"clearAll":true}';
 
   let content: string;
   try {
@@ -1165,7 +1176,7 @@ async function main(): Promise<void> {
             `Got it — saved your macro preferences for this chat.\n` +
             `Tracked keywords: ${keywordsPretty}\n` +
             `Watchlist: ${watchlistPretty}\n` +
-            `Sentiment threshold: ${prefs.sentimentThreshold}\n` +
+            `${formatSeverityThresholdLine(prefs.severityThreshold)}\n` +
             `Source trust: ${sourceTrustPretty}`;
           // The update is already saved above; if the confirmation can't be
           // delivered (even after retries) just log it — don't fall through to
